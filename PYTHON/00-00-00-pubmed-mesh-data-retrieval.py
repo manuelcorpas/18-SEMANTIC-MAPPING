@@ -1,16 +1,11 @@
 """
-PUBMED DISEASE ABSTRACTS RETRIEVAL (1975-2024) - SMART CHUNKING VERSION
+PUBMED CONDITION-SPECIFIC ABSTRACTS RETRIEVAL (1975-2024)
 
-Improved chunking algorithm that prevents data loss by using:
-- Disease category splitting when time chunks exceed limits
-- Binary search for optimal date ranges
-- Hour-level chunking for extreme cases
-- Adaptive chunk sizing based on publication growth trends
-
-KEY IMPROVEMENTS:
-- NO DATA LOSS: Multiple strategies to stay under 9,999 limit
-- FASTER: Smarter initial chunk sizes reduce unnecessary API calls
-- ROBUST: Handles even the busiest publication periods
+Retrieves disease-related research articles by specific conditions with intelligent chunking:
+- Searches 200+ individual disease conditions across 50 years
+- Implements minute-level chunking when needed (Year → Month → Week → Day → Hour → Minute)
+- Tracks completeness for each condition-year combination
+- Saves data organized by condition
 """
 
 import os
@@ -38,14 +33,16 @@ except ImportError:
     TQDM_AVAILABLE = False
     print("Install tqdm for better progress bars: pip install tqdm")
     class tqdm:
-        def __init__(self, iterable, desc="", total=None, leave=True):
+        def __init__(self, iterable=None, desc="", total=None, leave=True):
             self.iterable = iterable
             self.desc = desc
+            self.total = total
             print(f"{desc}: Starting...")
         
         def __iter__(self):
-            for item in self.iterable:
-                yield item
+            if self.iterable:
+                for item in self.iterable:
+                    yield item
         
         def update(self, n=1):
             pass
@@ -60,7 +57,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('pubmed_retrieval.log'),
+        logging.FileHandler('pubmed_condition_retrieval.log'),
         logging.StreamHandler()
     ]
 )
@@ -68,81 +65,161 @@ logger = logging.getLogger(__name__)
 
 # Setup paths
 current_dir = os.getcwd()
-data_dir = os.path.join(current_dir, "DATA")
-progress_dir = os.path.join(data_dir, "yearly_progress")
-checkpoint_file = os.path.join(data_dir, "retrieval_checkpoint.json")
+data_dir = os.path.join(current_dir, "CONDITION_DATA")
+progress_dir = os.path.join(data_dir, "condition_progress")
+checkpoint_file = os.path.join(data_dir, "condition_retrieval_checkpoint.json")
+completeness_file = os.path.join(data_dir, "retrieval_completeness.json")
 os.makedirs(data_dir, exist_ok=True)
 os.makedirs(progress_dir, exist_ok=True)
 
 # Configure Entrez - CHANGE THIS TO YOUR EMAIL
 Entrez.email = "mc@manuelcorpas.com"  # REQUIRED: Change to your email
-Entrez.tool = "DiseaseAbstractRetrieval"
+Entrez.tool = "ConditionAbstractRetrieval"
 Entrez.api_key = "44271e8e8b6d39627a80dc93092a718c6808"  # Optional: Add NCBI API key
 
-def load_checkpoint():
-    """Load checkpoint to resume from interruption"""
-    if os.path.exists(checkpoint_file):
-        try:
-            with open(checkpoint_file, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+# Complete list of conditions to search
+CONDITIONS = [
+    "Breast cancer", "Cervical cancer", "Uterine cancer", "Prostate cancer", "Colon and rectum cancer",
+    "Lip and oral cavity cancer", "Nasopharynx cancer", "Other pharynx cancer", "Gallbladder and biliary tract cancer",
+    "Pancreatic cancer", "Malignant skin melanoma", "Non-melanoma skin cancer", "Ovarian cancer", "Testicular cancer",
+    "Kidney cancer", "Bladder cancer", "Brain and central nervous system cancer", "Thyroid cancer", "Mesothelioma",
+    "Hodgkin lymphoma", "Non-Hodgkin lymphoma", "Multiple myeloma", "Leukemia", "Other malignant neoplasms",
+    "Other neoplasms", "Rheumatic heart disease", "Endocrine metabolic blood and immune disorders",
+    "Rheumatoid arthritis", "Other musculoskeletal disorders", "Congenital birth defects", "Typhoid and paratyphoid",
+    "Invasive Non-typhoidal Salmonella (iNTS)", "Bacterial skin diseases", "Upper digestive system diseases",
+    "Pulmonary Arterial Hypertension", "Malaria", "Chagas disease", "Leishmaniasis", "African trypanosomiasis",
+    "Schistosomiasis", "Cysticercosis", "Cystic echinococcosis", "Dengue", "Yellow fever", "Rabies",
+    "Intestinal nematode infections", "Other neglected tropical diseases", "Maternal disorders", "Neonatal disorders",
+    "Tuberculosis", "HIV/AIDS", "Diarrheal diseases", "Other intestinal infectious diseases", "Lower respiratory infections",
+    "Upper respiratory infections", "Otitis media", "Meningitis", "Encephalitis", "Diphtheria", "Pertussis", "Tetanus",
+    "Protein-energy malnutrition", "Appendicitis", "Paralytic ileus and intestinal obstruction",
+    "Inguinal femoral and abdominal hernia", "Inflammatory bowel disease", "Vascular intestinal disorders",
+    "Gallbladder and biliary diseases", "Pancreatitis", "Measles", "Varicella and herpes zoster",
+    "Ischemic heart disease", "Stroke", "Hypertensive heart disease", "Cardiomyopathy and myocarditis",
+    "Atrial fibrillation and flutter", "Aortic aneurysm", "Lower extremity peripheral arterial disease",
+    "Endocarditis", "Non-rheumatic valvular heart disease", "Other cardiovascular and circulatory diseases",
+    "Chronic obstructive pulmonary disease", "Other digestive diseases", "Alzheimer's disease and other dementias",
+    "Parkinson's disease", "Idiopathic epilepsy", "Multiple sclerosis", "Motor neuron disease",
+    "Other neurological disorders", "Adverse effects of medical treatment", "Animal contact", "Foreign body",
+    "Pneumoconiosis", "Asthma", "Interstitial lung disease and pulmonary sarcoidosis",
+    "Other chronic respiratory diseases", "Cirrhosis and other chronic liver diseases", "Decubitus ulcer",
+    "Other skin and subcutaneous diseases", "Sudden infant death syndrome", "Road injuries", "Self-harm",
+    "Interpersonal violence", "Exposure to forces of nature", "Environmental heat and cold exposure", "Ebola",
+    "Other transport injuries", "Falls", "Drowning", "Fire heat and hot substances", "Poisonings",
+    "Exposure to mechanical forces", "Eye cancer", "Soft tissue and other extraosseous sarcomas",
+    "Malignant neoplasm of bone and articular cartilage", "Other nutritional deficiencies",
+    "Sexually transmitted infections excluding HIV", "Acute hepatitis", "Other unspecified infectious diseases",
+    "Esophageal cancer", "Stomach cancer", "Liver cancer", "Larynx cancer", "Tracheal bronchus and lung cancer",
+    "Alcohol use disorders", "Drug use disorders", "Eating disorders", "Diabetes mellitus", "Acute glomerulonephritis",
+    "Chronic kidney disease", "Urinary diseases and male infertility", "Gynecological diseases",
+    "Hemoglobinopathies and hemolytic anemias", "Police conflict and executions", "Zika virus",
+    "Conflict and terrorism", "Neuroblastoma and other peripheral nervous cell tumors", "COVID-19",
+    "Other unintentional injuries", "Leprosy", "Schizophrenia", "Depressive disorders", "Acne vulgaris",
+    "Alopecia areata", "Pruritus", "Urticaria", "Age-related and other hearing loss", "Other sense organ diseases",
+    "Oral disorders", "Headache disorders", "Bipolar disorder", "Anxiety disorders", "Autism spectrum disorders",
+    "Attention-deficit/hyperactivity disorder", "Conduct disorder", "Idiopathic developmental intellectual disability",
+    "Other mental disorders", "Blindness and vision loss", "Lymphatic filariasis", "Onchocerciasis", "Trachoma",
+    "Food-borne trematodiases", "Iodine deficiency", "Vitamin A deficiency", "Dietary iron deficiency",
+    "Osteoarthritis", "Low back pain", "Neck pain", "Gout", "Dermatitis", "Psoriasis", "Scabies",
+    "Fungal skin diseases", "Viral skin diseases", "Guinea worm disease"
+]
 
-def save_checkpoint(year, month=None):
-    """Save progress checkpoint"""
-    checkpoint = load_checkpoint()
-    checkpoint['last_year'] = year
-    checkpoint['last_month'] = month
-    checkpoint['timestamp'] = datetime.now().isoformat()
+# Mapping of conditions to MeSH terms and search strategies
+CONDITION_SEARCH_MAPPING = {
+    # Cancers
+    "Breast cancer": '"Breast Neoplasms"[MeSH] OR "breast cancer"[Title/Abstract]',
+    "Cervical cancer": '"Uterine Cervical Neoplasms"[MeSH] OR "cervical cancer"[Title/Abstract]',
+    "Uterine cancer": '"Uterine Neoplasms"[MeSH] OR "uterine cancer"[Title/Abstract] OR "endometrial cancer"[Title/Abstract]',
+    "Prostate cancer": '"Prostatic Neoplasms"[MeSH] OR "prostate cancer"[Title/Abstract]',
+    "Colon and rectum cancer": '"Colorectal Neoplasms"[MeSH] OR "colorectal cancer"[Title/Abstract] OR "colon cancer"[Title/Abstract] OR "rectal cancer"[Title/Abstract]',
+    "Lip and oral cavity cancer": '"Mouth Neoplasms"[MeSH] OR "oral cancer"[Title/Abstract] OR "lip cancer"[Title/Abstract]',
+    "Nasopharynx cancer": '"Nasopharyngeal Neoplasms"[MeSH] OR "nasopharyngeal cancer"[Title/Abstract]',
+    "Other pharynx cancer": '"Pharyngeal Neoplasms"[MeSH] OR "pharyngeal cancer"[Title/Abstract]',
+    "Gallbladder and biliary tract cancer": '"Gallbladder Neoplasms"[MeSH] OR "Biliary Tract Neoplasms"[MeSH] OR "gallbladder cancer"[Title/Abstract]',
+    "Pancreatic cancer": '"Pancreatic Neoplasms"[MeSH] OR "pancreatic cancer"[Title/Abstract]',
+    "Malignant skin melanoma": '"Melanoma"[MeSH] OR "malignant melanoma"[Title/Abstract]',
+    "Non-melanoma skin cancer": '"Skin Neoplasms"[MeSH] NOT "Melanoma"[MeSH] OR "basal cell carcinoma"[Title/Abstract] OR "squamous cell carcinoma"[Title/Abstract]',
+    "Ovarian cancer": '"Ovarian Neoplasms"[MeSH] OR "ovarian cancer"[Title/Abstract]',
+    "Testicular cancer": '"Testicular Neoplasms"[MeSH] OR "testicular cancer"[Title/Abstract]',
+    "Kidney cancer": '"Kidney Neoplasms"[MeSH] OR "renal cell carcinoma"[Title/Abstract]',
+    "Bladder cancer": '"Urinary Bladder Neoplasms"[MeSH] OR "bladder cancer"[Title/Abstract]',
+    "Brain and central nervous system cancer": '"Brain Neoplasms"[MeSH] OR "Central Nervous System Neoplasms"[MeSH] OR "brain cancer"[Title/Abstract]',
+    "Thyroid cancer": '"Thyroid Neoplasms"[MeSH] OR "thyroid cancer"[Title/Abstract]',
+    "Mesothelioma": '"Mesothelioma"[MeSH] OR "mesothelioma"[Title/Abstract]',
+    "Hodgkin lymphoma": '"Hodgkin Disease"[MeSH] OR "hodgkin lymphoma"[Title/Abstract]',
+    "Non-Hodgkin lymphoma": '"Lymphoma, Non-Hodgkin"[MeSH] OR "non-hodgkin lymphoma"[Title/Abstract]',
+    "Multiple myeloma": '"Multiple Myeloma"[MeSH] OR "multiple myeloma"[Title/Abstract]',
+    "Leukemia": '"Leukemia"[MeSH] OR "leukemia"[Title/Abstract] OR "leukaemia"[Title/Abstract]',
+    "Esophageal cancer": '"Esophageal Neoplasms"[MeSH] OR "esophageal cancer"[Title/Abstract]',
+    "Stomach cancer": '"Stomach Neoplasms"[MeSH] OR "gastric cancer"[Title/Abstract]',
+    "Liver cancer": '"Liver Neoplasms"[MeSH] OR "hepatocellular carcinoma"[Title/Abstract]',
+    "Larynx cancer": '"Laryngeal Neoplasms"[MeSH] OR "laryngeal cancer"[Title/Abstract]',
+    "Tracheal bronchus and lung cancer": '"Lung Neoplasms"[MeSH] OR "lung cancer"[Title/Abstract]',
     
-    try:
-        with open(checkpoint_file, 'w') as f:
-            json.dump(checkpoint, f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save checkpoint: {e}")
-
-# Disease categories for splitting when needed
-DISEASE_CATEGORIES = {
-    'cancer': ['"Neoplasms"[MeSH]'],
-    'infectious': ['"Infections"[MeSH]', '"Communicable Diseases"[MeSH]'],
-    'cardiovascular': ['"Cardiovascular Diseases"[MeSH]'],
-    'mental': ['"Mental Disorders"[MeSH]'],
-    'neurological': ['"Nervous System Diseases"[MeSH]'],
-    'respiratory': ['"Respiratory Tract Diseases"[MeSH]'],
-    'digestive': ['"Digestive System Diseases"[MeSH]'],
-    'metabolic': ['"Nutritional and Metabolic Diseases"[MeSH]'],
-    'genetic': ['"Genetic Diseases, Inborn"[MeSH]'],
-    'musculoskeletal': ['"Musculoskeletal Diseases"[MeSH]'],
-    'other': ['"Disease"[MeSH]', '"Pathological Conditions, Signs and Symptoms"[MeSH]']
+    # Infectious diseases
+    "Tuberculosis": '"Tuberculosis"[MeSH] OR "tuberculosis"[Title/Abstract]',
+    "HIV/AIDS": '"HIV Infections"[MeSH] OR "Acquired Immunodeficiency Syndrome"[MeSH] OR "HIV"[Title/Abstract] OR "AIDS"[Title/Abstract]',
+    "Malaria": '"Malaria"[MeSH] OR "malaria"[Title/Abstract]',
+    "Dengue": '"Dengue"[MeSH] OR "dengue"[Title/Abstract]',
+    "COVID-19": '"COVID-19"[MeSH] OR "SARS-CoV-2"[MeSH] OR "covid-19"[Title/Abstract] OR "coronavirus disease 2019"[Title/Abstract]',
+    "Ebola": '"Hemorrhagic Fever, Ebola"[MeSH] OR "ebola"[Title/Abstract]',
+    "Measles": '"Measles"[MeSH] OR "measles"[Title/Abstract]',
+    "Hepatitis": '"Hepatitis"[MeSH] OR "hepatitis"[Title/Abstract]',
+    
+    # Cardiovascular diseases
+    "Ischemic heart disease": '"Myocardial Ischemia"[MeSH] OR "ischemic heart disease"[Title/Abstract]',
+    "Stroke": '"Stroke"[MeSH] OR "stroke"[Title/Abstract] OR "cerebrovascular accident"[Title/Abstract]',
+    "Hypertensive heart disease": '"Hypertensive Heart Disease"[MeSH] OR "hypertensive heart disease"[Title/Abstract]',
+    "Atrial fibrillation and flutter": '"Atrial Fibrillation"[MeSH] OR "Atrial Flutter"[MeSH] OR "atrial fibrillation"[Title/Abstract]',
+    
+    # Neurological conditions
+    "Alzheimer's disease and other dementias": '"Alzheimer Disease"[MeSH] OR "Dementia"[MeSH] OR "alzheimer"[Title/Abstract]',
+    "Parkinson's disease": '"Parkinson Disease"[MeSH] OR "parkinson"[Title/Abstract]',
+    "Multiple sclerosis": '"Multiple Sclerosis"[MeSH] OR "multiple sclerosis"[Title/Abstract]',
+    "Idiopathic epilepsy": '"Epilepsy"[MeSH] OR "epilepsy"[Title/Abstract]',
+    
+    # Mental health
+    "Schizophrenia": '"Schizophrenia"[MeSH] OR "schizophrenia"[Title/Abstract]',
+    "Depressive disorders": '"Depressive Disorder"[MeSH] OR "depression"[Title/Abstract]',
+    "Bipolar disorder": '"Bipolar Disorder"[MeSH] OR "bipolar"[Title/Abstract]',
+    "Anxiety disorders": '"Anxiety Disorders"[MeSH] OR "anxiety disorder"[Title/Abstract]',
+    "Autism spectrum disorders": '"Autism Spectrum Disorder"[MeSH] OR "autism"[Title/Abstract]',
+    "Attention-deficit/hyperactivity disorder": '"Attention Deficit Disorder with Hyperactivity"[MeSH] OR "ADHD"[Title/Abstract]',
+    
+    # Respiratory diseases
+    "Chronic obstructive pulmonary disease": '"Pulmonary Disease, Chronic Obstructive"[MeSH] OR "COPD"[Title/Abstract]',
+    "Asthma": '"Asthma"[MeSH] OR "asthma"[Title/Abstract]',
+    "Pneumoconiosis": '"Pneumoconiosis"[MeSH] OR "pneumoconiosis"[Title/Abstract]',
+    
+    # Metabolic and endocrine
+    "Diabetes mellitus": '"Diabetes Mellitus"[MeSH] OR "diabetes"[Title/Abstract]',
+    "Chronic kidney disease": '"Renal Insufficiency, Chronic"[MeSH] OR "chronic kidney disease"[Title/Abstract]',
+    
+    # Add remaining conditions with appropriate search terms...
+    # This is a partial mapping - you'll need to complete it for all 200+ conditions
 }
 
-# Estimated annual publication growth (rough estimates)
-PUBLICATION_ESTIMATES = {
-    range(1975, 1980): 50000,   # 1970s: ~50k/year
-    range(1980, 1990): 100000,  # 1980s: ~100k/year
-    range(1990, 2000): 200000,  # 1990s: ~200k/year
-    range(2000, 2010): 400000,  # 2000s: ~400k/year
-    range(2010, 2020): 800000,  # 2010s: ~800k/year
-    range(2020, 2025): 1200000, # 2020s: ~1.2M/year
-}
+def get_condition_search_query(condition: str) -> str:
+    """Get the appropriate search query for a condition"""
+    # Use mapping if available, otherwise create a basic search
+    if condition in CONDITION_SEARCH_MAPPING:
+        return CONDITION_SEARCH_MAPPING[condition]
+    else:
+        # Fallback: use the condition name as a search term
+        # Clean the condition name for search
+        clean_name = condition.lower().replace(" and ", " ").replace("/", " ")
+        return f'"{condition}"[Title/Abstract] OR "{clean_name}"[Title/Abstract]'
 
-def estimate_articles_per_year(year: int) -> int:
-    """Estimate number of articles for a given year"""
-    for year_range, estimate in PUBLICATION_ESTIMATES.items():
-        if year in year_range:
-            return estimate
-    return 1000000  # Default conservative estimate
-
-def create_disease_search_query(
+def create_condition_search_query(
+    condition: str,
     year: Optional[int] = None,
     month: Optional[int] = None,
     day: Optional[int] = None,
     hour_range: Optional[Tuple[int, int]] = None,
-    date_range: Optional[Tuple[str, str]] = None,
-    disease_category: Optional[str] = None
+    minute_range: Optional[Tuple[int, int]] = None,
+    date_range: Optional[Tuple[str, str]] = None
 ) -> str:
-    """Create search query with flexible parameters"""
+    """Create search query for a specific condition with temporal constraints"""
     base_criteria = [
         '"journal article"[Publication Type]',
         'english[Language]',
@@ -150,24 +227,26 @@ def create_disease_search_query(
         'hasabstract[text]'
     ]
     
-    # Add disease criteria
-    if disease_category and disease_category in DISEASE_CATEGORIES:
-        disease_terms = DISEASE_CATEGORIES[disease_category]
-    else:
-        # All disease terms
-        all_disease_terms = []
-        for terms in DISEASE_CATEGORIES.values():
-            all_disease_terms.extend(terms)
-        disease_terms = list(set(all_disease_terms))
-    
-    base_criteria.append(f'({" OR ".join(disease_terms)})')
+    # Add condition-specific search terms
+    condition_query = get_condition_search_query(condition)
+    base_criteria.append(f'({condition_query})')
     
     # Add date constraints
     if date_range:
         start_date, end_date = date_range
         date_constraint = f'"{start_date}"[Date - Publication] : "{end_date}"[Date - Publication]'
+    elif minute_range and year and month and day:
+        # Minute-level precision (if supported by PubMed)
+        start_min, end_min = minute_range
+        if hour_range:
+            start_hour, end_hour = hour_range
+        else:
+            start_hour = end_hour = 0
+        start_time = f"{year}/{month:02d}/{day:02d} {start_hour:02d}:{start_min:02d}"
+        end_time = f"{year}/{month:02d}/{day:02d} {end_hour:02d}:{end_min:02d}"
+        date_constraint = f'"{start_time}"[PDAT] : "{end_time}"[PDAT]'
     elif hour_range and year and month and day:
-        # PubMed doesn't support hour-level directly, but we can use PDAT
+        # Hour-level precision
         start_hour, end_hour = hour_range
         start_time = f"{year}/{month:02d}/{day:02d} {start_hour:02d}:00"
         end_time = f"{year}/{month:02d}/{day:02d} {end_hour:02d}:59"
@@ -185,454 +264,342 @@ def create_disease_search_query(
     
     return ' AND '.join(base_criteria)
 
-def binary_search_date_split(start_date: str, end_date: str, target_count: int = 5000) -> List[Tuple[str, str]]:
-    """Use binary search to find optimal date ranges that stay under 9999 limit"""
-    date_ranges = []
-    
-    # Convert to datetime objects
-    start = datetime.strptime(start_date, "%Y/%m/%d")
-    end = datetime.strptime(end_date, "%Y/%m/%d")
-    
-    def search_range(s_date: datetime, e_date: datetime, depth: int = 0):
-        # Prevent infinite recursion
-        if depth > 20:
-            logger.error(f"Max recursion depth reached for {s_date} to {e_date}")
-            return [(s_date.strftime("%Y/%m/%d"), e_date.strftime("%Y/%m/%d"), 9999)]
-        
-        if s_date > e_date:
-            return []
-        
-        # Format dates
-        s_str = s_date.strftime("%Y/%m/%d")
-        e_str = e_date.strftime("%Y/%m/%d")
-        
-        # Check count for this range
-        query = create_disease_search_query(date_range=(s_str, e_str))
+def load_checkpoint():
+    """Load checkpoint to resume from interruption"""
+    if os.path.exists(checkpoint_file):
         try:
-            handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
-            result = Entrez.read(handle)
-            handle.close()
-            count = int(result["Count"])
-            
-            if count == 0:
-                return []
-            elif count <= 9999:
-                return [(s_str, e_str, count)]
-            else:
-                # Check if this is a single day
-                if s_date == e_date:
-                    # Can't split a single day further
-                    logger.warning(f"  Single day {s_str} has {count:,} articles - splitting by disease category")
-                    # Return marker for disease category split
-                    return [(s_str, e_str, -count)]  # Negative count indicates need for disease split
-                
-                # Calculate midpoint
-                total_days = (e_date - s_date).days
-                if total_days == 0:
-                    # Same day, can't split
-                    logger.warning(f"  Cannot split {s_str} with {count:,} articles")
-                    return [(s_str, e_str, -count)]
-                
-                mid_date = s_date + timedelta(days=total_days // 2)
-                
-                # Make sure we're actually splitting
-                if mid_date == s_date or mid_date == e_date:
-                    # Can't split further
-                    if total_days == 1:
-                        # Two consecutive days, split them
-                        left_ranges = search_range(s_date, s_date, depth + 1)
-                        right_ranges = search_range(e_date, e_date, depth + 1)
-                    else:
-                        # Shouldn't happen, but handle it
-                        logger.warning(f"  Cannot properly split {s_str} to {e_str}")
-                        return [(s_str, e_str, -count)]
-                else:
-                    # Recursively search both halves
-                    left_ranges = search_range(s_date, mid_date, depth + 1)
-                    right_ranges = search_range(mid_date + timedelta(days=1), e_date, depth + 1)
-                
-                return left_ranges + right_ranges
-                
-        except Exception as e:
-            logger.error(f"Error in binary search for {s_str} to {e_str}: {e}")
-            return []
-    
-    return search_range(start, end)
+            with open(checkpoint_file, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
 
-def smart_chunk_year(year: int) -> List[Dict[str, any]]:
-    """Smart chunking based on estimated volume"""
-    year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")
-    
-    # Check if already processed
-    if os.path.exists(year_file):
-        try:
-            df = pd.read_csv(year_file)
-            if 'Abstract' in df.columns and not df['Abstract'].isna().all():
-                logger.info(f"Year {year} already processed: {len(df):,} articles")
-                return df.to_dict('records')
-        except Exception as e:
-            logger.warning(f"Reprocessing year {year}: {e}")
-    
-    logger.info(f"Processing year {year} with smart chunking...")
-    
-    # Estimate expected volume
-    estimated_volume = estimate_articles_per_year(year)
-    logger.info(f"  Estimated volume: ~{estimated_volume:,} articles")
+def save_checkpoint(condition: str, year: int, status: str = "processing"):
+    """Save progress checkpoint"""
+    checkpoint = load_checkpoint()
+    if condition not in checkpoint:
+        checkpoint[condition] = {}
+    checkpoint[condition][str(year)] = {
+        'status': status,
+        'timestamp': datetime.now().isoformat()
+    }
     
     try:
-        # Determine initial chunk strategy
-        if estimated_volume < 100000:  # Can likely handle by month
-            year_articles = process_year_by_month(year)
-        elif estimated_volume < 500000:  # Need week-level
-            year_articles = process_year_by_week(year)
-        else:  # High volume - start with day-level
-            year_articles = process_year_by_day(year)
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save checkpoint: {e}")
+
+def load_completeness_tracking():
+    """Load completeness tracking data"""
+    if os.path.exists(completeness_file):
+        try:
+            with open(completeness_file, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_completeness_tracking(condition: str, year: int, total_found: int, total_retrieved: int):
+    """Save completeness tracking information"""
+    tracking = load_completeness_tracking()
+    if condition not in tracking:
+        tracking[condition] = {}
+    tracking[condition][str(year)] = {
+        'total_found': total_found,
+        'total_retrieved': total_retrieved,
+        'completeness': (total_retrieved / total_found * 100) if total_found > 0 else 100,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    try:
+        with open(completeness_file, 'w') as f:
+            json.dump(tracking, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save completeness tracking: {e}")
+
+def process_condition_year(condition: str, year: int) -> Tuple[List[Dict], int, int]:
+    """Process a specific condition for a specific year"""
+    condition_dir = os.path.join(progress_dir, condition.replace("/", "_").replace(" ", "_"))
+    os.makedirs(condition_dir, exist_ok=True)
+    
+    year_file = os.path.join(condition_dir, f"{condition.replace('/', '_').replace(' ', '_')}_{year}.csv")
+    
+    # Check if already processed
+    checkpoint = load_checkpoint()
+    if condition in checkpoint and str(year) in checkpoint[condition]:
+        if checkpoint[condition][str(year)]['status'] == 'complete':
+            try:
+                df = pd.read_csv(year_file)
+                if 'Abstract' in df.columns and not df['Abstract'].isna().all():
+                    logger.info(f"  {condition} - {year}: Already processed ({len(df):,} articles)")
+                    return df.to_dict('records'), len(df), len(df)
+            except:
+                pass
+    
+    logger.info(f"Processing {condition} - Year {year}")
+    save_checkpoint(condition, year, "processing")
+    
+    # First, check total count for this condition-year
+    query = create_condition_search_query(condition=condition, year=year)
+    
+    try:
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
+        result = Entrez.read(handle)
+        handle.close()
+        total_count = int(result["Count"])
         
-        # Save the results immediately after processing
-        if year_articles:
-            df = pd.DataFrame(year_articles)
-            df.to_csv(year_file, index=False)
-            logger.info(f"✓ Successfully saved {len(year_articles):,} articles for year {year}")
-            save_checkpoint(year)  # Save checkpoint after successful save
+        if total_count == 0:
+            logger.info(f"  No articles found for {condition} in {year}")
+            save_checkpoint(condition, year, "complete")
+            save_completeness_tracking(condition, year, 0, 0)
+            return [], 0, 0
+        
+        logger.info(f"  Found {total_count:,} articles for {condition} in {year}")
+        
+        if total_count <= 9999:
+            # Can retrieve all at once
+            articles = retrieve_articles_batch(condition, year, query, total_count)
+            retrieved_count = len(articles)
         else:
-            logger.warning(f"No articles found for year {year}")
+            # Need chunking
+            articles, retrieved_count = process_with_chunking(condition, year, total_count)
         
-        return year_articles
+        # Save results
+        if articles:
+            df = pd.DataFrame(articles)
+            df['Condition'] = condition  # Add condition column
+            df.to_csv(year_file, index=False)
+            logger.info(f"  Saved {len(articles):,} articles for {condition} - {year}")
+        
+        save_checkpoint(condition, year, "complete")
+        save_completeness_tracking(condition, year, total_count, retrieved_count)
+        
+        return articles, total_count, retrieved_count
         
     except Exception as e:
-        logger.error(f"Error in smart_chunk_year for {year}: {e}")
-        logger.error(f"Traceback: ", exc_info=True)
-        return []
+        logger.error(f"Error processing {condition} - {year}: {e}")
+        save_checkpoint(condition, year, "error")
+        return [], 0, 0
 
-def process_year_by_month(year: int) -> List[Dict]:
-    """Process year month by month with overflow handling"""
-    year_articles = []
-    year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")  # FIX: Define year_file
+def process_with_chunking(condition: str, year: int, total_count: int) -> Tuple[List[Dict], int]:
+    """Process a condition-year with intelligent chunking"""
+    logger.info(f"  Chunking required for {condition} - {year} ({total_count:,} articles)")
     
+    all_articles = []
+    retrieved_count = 0
+    
+    # Try monthly chunks first
     for month in range(1, 13):
-        query = create_disease_search_query(year=year, month=month)
+        query = create_condition_search_query(condition=condition, year=year, month=month)
         
         try:
             handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
             result = Entrez.read(handle)
             handle.close()
-            count = int(result["Count"])
+            month_count = int(result["Count"])
             
-            if count == 0:
+            if month_count == 0:
                 continue
             
-            logger.info(f"  {year}/{month:02d}: {count:,} articles")
-            
-            if count <= 9999:
-                # Fetch directly
-                handle = Entrez.esearch(db="pubmed", term=query, retmax=count)
-                result = Entrez.read(handle)
-                handle.close()
-                
-                pmids = result["IdList"]
-                articles = fetch_articles_with_abstracts(pmids, f"{year}/{month:02d}")
-                year_articles.extend(articles)
+            if month_count <= 9999:
+                # Month is manageable
+                articles = retrieve_articles_batch(condition, year, query, month_count, f"{year}/{month:02d}")
+                all_articles.extend(articles)
+                retrieved_count += len(articles)
             else:
-                # Use binary search to find optimal splits
-                days_in_month = calendar.monthrange(year, month)[1]
-                start_date = f"{year}/{month:02d}/01"
-                end_date = f"{year}/{month:02d}/{days_in_month:02d}"
+                # Need weekly or daily chunking
+                logger.info(f"    Month {year}/{month:02d} has {month_count:,} articles - chunking further")
+                month_articles = process_month_with_chunking(condition, year, month, month_count)
+                all_articles.extend(month_articles)
+                retrieved_count += len(month_articles)
                 
-                logger.info(f"    Using binary search for {year}/{month:02d}")
-                date_ranges = binary_search_date_split(start_date, end_date)
-                
-                for date_start, date_end, range_count in date_ranges:
-                    if range_count < 0:
-                        # Negative count means we need disease category splitting
-                        actual_count = -range_count
-                        logger.warning(f"    Day {date_start} has {actual_count:,} articles - using disease splits")
-                        
-                        # Parse the date for disease category processing
-                        date_obj = datetime.strptime(date_start, "%Y/%m/%d")
-                        day_articles = process_day_by_disease_category(
-                            date_obj.year, 
-                            date_obj.month, 
-                            date_obj.day
-                        )
-                        year_articles.extend(day_articles)
-                        
-                    elif range_count > 0:
-                        query = create_disease_search_query(date_range=(date_start, date_end))
-                        handle = Entrez.esearch(db="pubmed", term=query, retmax=range_count)
-                        result = Entrez.read(handle)
-                        handle.close()
-                        
-                        pmids = result["IdList"]
-                        articles = fetch_articles_with_abstracts(pmids, f"{date_start}-{date_end}")
-                        year_articles.extend(articles)
-            
         except Exception as e:
-            logger.error(f"Error processing {year}/{month:02d}: {e}")
+            logger.error(f"Error processing month {year}/{month:02d}: {e}")
             continue
     
-    # Save progress
-    if year_articles:
-        df = pd.DataFrame(year_articles)
-        df.to_csv(year_file, index=False)
-        logger.info(f"Saved {len(year_articles):,} articles for year {year}")
-        gc.collect()
-    
-    return year_articles
+    return all_articles, retrieved_count
 
-def process_year_by_week(year: int) -> List[Dict]:
-    """Process year week by week"""
-    year_articles = []
-    year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")  # FIX: Define year_file
+def process_month_with_chunking(condition: str, year: int, month: int, total_count: int) -> List[Dict]:
+    """Process a month with weekly/daily chunking"""
+    month_articles = []
+    days_in_month = calendar.monthrange(year, month)[1]
     
-    # Generate all weeks in the year
-    start_date = datetime(year, 1, 1)
-    end_date = datetime(year, 12, 31)
+    # Try weekly chunks
+    week_starts = list(range(1, days_in_month + 1, 7))
     
-    current_date = start_date
-    while current_date <= end_date:
-        week_end = min(current_date + timedelta(days=6), end_date)
+    for week_start in week_starts:
+        week_end = min(week_start + 6, days_in_month)
+        start_date = f"{year}/{month:02d}/{week_start:02d}"
+        end_date = f"{year}/{month:02d}/{week_end:02d}"
         
-        week_start_str = current_date.strftime("%Y/%m/%d")
-        week_end_str = week_end.strftime("%Y/%m/%d")
-        
-        query = create_disease_search_query(date_range=(week_start_str, week_end_str))
+        query = create_condition_search_query(condition=condition, date_range=(start_date, end_date))
         
         try:
             handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
             result = Entrez.read(handle)
             handle.close()
-            count = int(result["Count"])
+            week_count = int(result["Count"])
             
-            if count == 0:
-                current_date += timedelta(days=7)
+            if week_count == 0:
                 continue
             
-            if count <= 9999:
-                logger.info(f"  Week {week_start_str}: {count:,} articles")
-                handle = Entrez.esearch(db="pubmed", term=query, retmax=count)
-                result = Entrez.read(handle)
-                handle.close()
-                
-                pmids = result["IdList"]
-                articles = fetch_articles_with_abstracts(pmids, f"Week {week_start_str}")
-                year_articles.extend(articles)
+            if week_count <= 9999:
+                articles = retrieve_articles_batch(condition, year, query, week_count, f"Week {start_date}")
+                month_articles.extend(articles)
             else:
-                # Binary search this week
-                logger.info(f"  Week {week_start_str}: {count:,} articles - using binary search")
-                date_ranges = binary_search_date_split(week_start_str, week_end_str)
+                # Need daily chunking
+                logger.info(f"      Week {start_date} has {week_count:,} articles - using daily chunks")
+                week_articles = process_week_with_chunking(condition, year, month, week_start, week_end)
+                month_articles.extend(week_articles)
                 
-                for date_start, date_end, range_count in date_ranges:
-                    if range_count < 0:
-                        # Negative count means we need disease category splitting
-                        actual_count = -range_count
-                        logger.warning(f"    Day {date_start} has {actual_count:,} articles - using disease splits")
-                        
-                        # Parse the date for disease category processing
-                        date_obj = datetime.strptime(date_start, "%Y/%m/%d")
-                        day_articles = process_day_by_disease_category(
-                            date_obj.year, 
-                            date_obj.month, 
-                            date_obj.day
-                        )
-                        year_articles.extend(day_articles)
-                        
-                    elif range_count > 0:
-                        query = create_disease_search_query(date_range=(date_start, date_end))
-                        handle = Entrez.esearch(db="pubmed", term=query, retmax=range_count)
-                        result = Entrez.read(handle)
-                        handle.close()
-                        
-                        pmids = result["IdList"]
-                        articles = fetch_articles_with_abstracts(pmids, f"{date_start}-{date_end}")
-                        year_articles.extend(articles)
-            
         except Exception as e:
-            logger.error(f"Error processing week {week_start_str}: {e}")
-        
-        current_date += timedelta(days=7)
+            logger.error(f"Error processing week {start_date}: {e}")
+            continue
     
-    # Save progress
-    if year_articles:
-        df = pd.DataFrame(year_articles)
-        df.to_csv(year_file, index=False)  # Now year_file is properly defined
-        logger.info(f"Saved {len(year_articles):,} articles for year {year}")
-        gc.collect()
-    
-    return year_articles
+    return month_articles
 
-def process_year_by_day(year: int) -> List[Dict]:
-    """Process year day by day with disease category splitting if needed"""
-    year_articles = []
-    year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")
+def process_week_with_chunking(condition: str, year: int, month: int, day_start: int, day_end: int) -> List[Dict]:
+    """Process a week with daily/hourly chunking"""
+    week_articles = []
     
-    start_date = datetime(year, 1, 1)
-    end_date = datetime(year, 12, 31)
-    
-    current_date = start_date
-    total_days = (end_date - start_date).days + 1
-    
-    pbar = tqdm(total=total_days, desc=f"Processing {year} by day") if TQDM_AVAILABLE else None
-    
-    while current_date <= end_date:
-        day_str = current_date.strftime("%Y/%m/%d")
-        
-        # First, try the full day
-        query = create_disease_search_query(
-            year=current_date.year,
-            month=current_date.month,
-            day=current_date.day
-        )
+    for day in range(day_start, day_end + 1):
+        query = create_condition_search_query(condition=condition, year=year, month=month, day=day)
         
         try:
             handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
             result = Entrez.read(handle)
             handle.close()
-            count = int(result["Count"])
+            day_count = int(result["Count"])
             
-            if count == 0:
-                current_date += timedelta(days=1)
-                if pbar:
-                    pbar.update(1)
+            if day_count == 0:
                 continue
             
-            if count <= 9999:
-                # Can handle this day directly
-                handle = Entrez.esearch(db="pubmed", term=query, retmax=count)
-                result = Entrez.read(handle)
-                handle.close()
-                
-                pmids = result["IdList"]
-                articles = fetch_articles_with_abstracts(pmids, f"Day {day_str}")
-                year_articles.extend(articles)
+            if day_count <= 9999:
+                articles = retrieve_articles_batch(condition, year, query, day_count, f"{year}/{month:02d}/{day:02d}")
+                week_articles.extend(articles)
             else:
-                # Day is too large - split by disease category
-                logger.warning(f"  Day {day_str}: {count:,} articles - splitting by disease category")
+                # Need hourly chunking
+                logger.info(f"        Day {year}/{month:02d}/{day:02d} has {day_count:,} articles - using hourly chunks")
+                day_articles = process_day_with_chunking(condition, year, month, day)
+                week_articles.extend(day_articles)
                 
-                day_articles = process_day_by_disease_category(
-                    current_date.year, 
-                    current_date.month, 
-                    current_date.day
-                )
-                year_articles.extend(day_articles)
-            
         except Exception as e:
-            logger.error(f"Error processing day {day_str}: {e}")
-        
-        current_date += timedelta(days=1)
-        if pbar:
-            pbar.update(1)
+            logger.error(f"Error processing day {year}/{month:02d}/{day:02d}: {e}")
+            continue
     
-    if pbar:
-        pbar.close()
-    
-    # Save progress
-    if year_articles:
-        df = pd.DataFrame(year_articles)
-        df.to_csv(year_file, index=False)
-        logger.info(f"Saved {len(year_articles):,} articles for year {year}")
-        gc.collect()
-    
-    return year_articles
+    return week_articles
 
-def process_day_by_disease_category(year: int, month: int, day: int) -> List[Dict]:
-    """Process a single day split by disease categories"""
+def process_day_with_chunking(condition: str, year: int, month: int, day: int) -> List[Dict]:
+    """Process a day with hourly/minute chunking"""
     day_articles = []
-    day_str = f"{year}/{month:02d}/{day:02d}"
     
-    for category_name, category_terms in DISEASE_CATEGORIES.items():
-        query = create_disease_search_query(
-            year=year,
-            month=month,
-            day=day,
-            disease_category=category_name
-        )
-        
-        try:
-            handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
-            result = Entrez.read(handle)
-            handle.close()
-            count = int(result["Count"])
-            
-            if count == 0:
-                continue
-            
-            if count <= 9999:
-                logger.info(f"    {day_str} [{category_name}]: {count:,} articles")
-                handle = Entrez.esearch(db="pubmed", term=query, retmax=count)
-                result = Entrez.read(handle)
-                handle.close()
-                
-                pmids = result["IdList"]
-                articles = fetch_articles_with_abstracts(
-                    pmids, 
-                    f"{day_str} [{category_name}]"
-                )
-                
-                # Tag with disease category
-                for article in articles:
-                    article['Disease_Category_Search'] = category_name
-                
-                day_articles.extend(articles)
-            else:
-                # Even a disease category for one day is too large
-                # Try hour-level chunking as last resort
-                logger.error(f"    📛 {day_str} [{category_name}]: {count:,} articles - trying hour chunks")
-                
-                hour_articles = process_day_by_hour(year, month, day, category_name)
-                day_articles.extend(hour_articles)
-            
-        except Exception as e:
-            logger.error(f"Error processing {day_str} [{category_name}]: {e}")
-            continue
-    
-    return day_articles
-
-def process_day_by_hour(year: int, month: int, day: int, disease_category: str = None) -> List[Dict]:
-    """Last resort: process by hour chunks (though PubMed may not have hour precision)"""
-    hour_articles = []
-    
-    # Try 6-hour chunks (0-5, 6-11, 12-17, 18-23)
+    # Try 6-hour chunks
     hour_chunks = [(0, 5), (6, 11), (12, 17), (18, 23)]
     
     for start_hour, end_hour in hour_chunks:
-        query = create_disease_search_query(
+        query = create_condition_search_query(
+            condition=condition,
             year=year,
             month=month,
             day=day,
-            hour_range=(start_hour, end_hour),
-            disease_category=disease_category
+            hour_range=(start_hour, end_hour)
         )
         
         try:
             handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
             result = Entrez.read(handle)
             handle.close()
-            count = int(result["Count"])
+            hour_count = int(result["Count"])
             
-            if count == 0:
+            if hour_count == 0:
                 continue
             
-            # Accept whatever we can get
-            fetch_count = min(count, 9999)
-            if count > 9999:
-                logger.error(f"      📛 LOSING {count - 9999} articles from hours {start_hour}-{end_hour}")
-            
-            handle = Entrez.esearch(db="pubmed", term=query, retmax=fetch_count)
-            result = Entrez.read(handle)
-            handle.close()
-            
-            pmids = result["IdList"]
-            articles = fetch_articles_with_abstracts(
-                pmids, 
-                f"{year}/{month:02d}/{day:02d} H{start_hour}-{end_hour}"
-            )
-            hour_articles.extend(articles)
-            
+            if hour_count <= 9999:
+                articles = retrieve_articles_batch(
+                    condition, year, query, hour_count, 
+                    f"{year}/{month:02d}/{day:02d} H{start_hour}-{end_hour}"
+                )
+                day_articles.extend(articles)
+            else:
+                # Need minute-level chunking (last resort)
+                logger.warning(f"          Hours {start_hour}-{end_hour} has {hour_count:,} articles - using MINUTE chunks")
+                hour_articles = process_hour_with_minute_chunking(
+                    condition, year, month, day, start_hour, end_hour, hour_count
+                )
+                day_articles.extend(hour_articles)
+                
         except Exception as e:
             logger.error(f"Error processing hours {start_hour}-{end_hour}: {e}")
             continue
     
+    return day_articles
+
+def process_hour_with_minute_chunking(
+    condition: str, year: int, month: int, day: int, 
+    start_hour: int, end_hour: int, total_count: int
+) -> List[Dict]:
+    """Last resort: process with minute-level chunking"""
+    hour_articles = []
+    
+    # Try 15-minute chunks within the hour range
+    total_hours = end_hour - start_hour + 1
+    total_minutes = total_hours * 60
+    
+    # Create 15-minute chunks
+    for hour in range(start_hour, end_hour + 1):
+        for minute_start in [0, 15, 30, 45]:
+            minute_end = min(minute_start + 14, 59)
+            
+            query = create_condition_search_query(
+                condition=condition,
+                year=year,
+                month=month,
+                day=day,
+                hour_range=(hour, hour),
+                minute_range=(minute_start, minute_end)
+            )
+            
+            try:
+                handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
+                result = Entrez.read(handle)
+                handle.close()
+                minute_count = int(result["Count"])
+                
+                if minute_count == 0:
+                    continue
+                
+                # Accept whatever we can get at minute level
+                fetch_count = min(minute_count, 9999)
+                if minute_count > 9999:
+                    logger.error(f"            📛 LOSING {minute_count - 9999} articles from {hour:02d}:{minute_start:02d}-{hour:02d}:{minute_end:02d}")
+                
+                articles = retrieve_articles_batch(
+                    condition, year, query, fetch_count,
+                    f"{year}/{month:02d}/{day:02d} {hour:02d}:{minute_start:02d}-{minute_end:02d}"
+                )
+                hour_articles.extend(articles)
+                
+            except Exception as e:
+                logger.error(f"Error processing minutes {hour:02d}:{minute_start:02d}-{minute_end:02d}: {e}")
+                continue
+    
     return hour_articles
+
+def retrieve_articles_batch(condition: str, year: int, query: str, count: int, description: str = "") -> List[Dict]:
+    """Retrieve a batch of articles"""
+    try:
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=count)
+        result = Entrez.read(handle)
+        handle.close()
+        
+        pmids = result["IdList"]
+        articles = fetch_articles_with_abstracts(pmids, f"{condition} - {description}")
+        
+        return articles
+    except Exception as e:
+        logger.error(f"Error retrieving batch for {condition}: {e}")
+        return []
 
 def fetch_articles_with_abstracts(pmids: List[str], batch_description: str) -> List[Dict]:
     """Fetch articles ensuring abstracts are included"""
@@ -773,55 +740,50 @@ def parse_pubmed_article_with_abstract(article_xml) -> Optional[Dict]:
         logger.error(f"Error parsing article: {e}")
         return None
 
-def combine_all_years() -> pd.DataFrame:
-    """Combine all yearly files into final dataset"""
-    logger.info("Combining all yearly files...")
+def generate_completeness_report():
+    """Generate a completeness report for all conditions"""
+    tracking = load_completeness_tracking()
     
-    all_dfs = []
-    years_found = []
+    report_lines = []
+    report_lines.append("="*80)
+    report_lines.append("RETRIEVAL COMPLETENESS REPORT")
+    report_lines.append("="*80)
     
-    for year in range(1975, 2025):
-        year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")
-        if os.path.exists(year_file):
-            try:
-                df = pd.read_csv(year_file)
-                if 'Abstract' in df.columns:
-                    valid_abstracts = df['Abstract'].notna() & (df['Abstract'].str.len() > 50)
-                    df = df[valid_abstracts]
-                    if len(df) > 0:
-                        all_dfs.append(df)
-                        years_found.append(year)
-                        logger.info(f"  Year {year}: {len(df):,} articles")
-            except Exception as e:
-                logger.error(f"Error loading year {year}: {e}")
+    for condition in CONDITIONS:
+        if condition in tracking:
+            report_lines.append(f"\n{condition}:")
+            total_found_all = 0
+            total_retrieved_all = 0
+            
+            for year in sorted(tracking[condition].keys()):
+                data = tracking[condition][year]
+                total_found_all += data['total_found']
+                total_retrieved_all += data['total_retrieved']
+                
+                if data['completeness'] < 100:
+                    report_lines.append(f"  {year}: {data['total_retrieved']:,}/{data['total_found']:,} ({data['completeness']:.1f}%)")
+            
+            overall_completeness = (total_retrieved_all / total_found_all * 100) if total_found_all > 0 else 100
+            report_lines.append(f"  TOTAL: {total_retrieved_all:,}/{total_found_all:,} ({overall_completeness:.1f}%)")
     
-    if not all_dfs:
-        logger.error("No valid data files found")
-        return None
+    report_text = "\n".join(report_lines)
     
-    logger.info(f"Combining {len(all_dfs)} yearly files...")
-    combined_df = pd.concat(all_dfs, ignore_index=True)
+    # Save report
+    report_file = os.path.join(data_dir, "completeness_report.txt")
+    with open(report_file, 'w') as f:
+        f.write(report_text)
     
-    # Remove duplicates
-    initial_count = len(combined_df)
-    combined_df = combined_df.drop_duplicates(subset=['PMID'], keep='first')
-    final_count = len(combined_df)
-    
-    if initial_count != final_count:
-        logger.info(f"Removed {initial_count - final_count:,} duplicate articles")
-    
-    return combined_df
+    print(report_text)
+    return report_text
 
 def main():
     """Main execution function"""
     print("="*80)
-    print("PUBMED DISEASE ABSTRACTS RETRIEVAL - SMART CHUNKING VERSION")
+    print("PUBMED CONDITION-SPECIFIC ABSTRACTS RETRIEVAL")
     print("="*80)
-    print("Improvements:")
-    print("  ✓ Binary search for optimal date ranges")
-    print("  ✓ Disease category splitting when needed")
-    print("  ✓ Adaptive chunk sizing based on year")
-    print("  ✓ Hour-level chunking as last resort")
+    print(f"Conditions to search: {len(CONDITIONS)}")
+    print(f"Years to cover: 1975-2024 (50 years)")
+    print(f"Total combinations: {len(CONDITIONS) * 50:,}")
     print("="*80)
     
     if Entrez.email == "your.email@example.com":
@@ -831,101 +793,70 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Email: {Entrez.email}")
     print(f"  API Key: {'Set' if Entrez.api_key else 'Not set'}")
-    print(f"  Period: 1975-2024")
     
-    # Check for existing data and checkpoint
+    # Check for existing checkpoint
     checkpoint = load_checkpoint()
-    existing_years = []
+    if checkpoint:
+        processed_count = sum(
+            1 for cond in checkpoint.values() 
+            for year_data in cond.values() 
+            if year_data.get('status') == 'complete'
+        )
+        print(f"\n📊 Found checkpoint with {processed_count:,} condition-year combinations completed")
     
-    for year in range(1975, 2025):
-        year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")
-        if os.path.exists(year_file):
-            try:
-                df = pd.read_csv(year_file)
-                if len(df) > 0:
-                    existing_years.append(year)
-            except:
-                pass
-    
-    if existing_years:
-        print(f"\n📊 Found existing data for {len(existing_years)} years")
-        print(f"   Years with data: {sorted(existing_years)}")
-        
-        # Ask user what to do
-        print("\nOptions:")
-        print("  1. Resume from where left off (skip completed years)")
-        print("  2. Start fresh from 1975 (reprocess all years)")
-        print("  3. Cancel")
-        
-        choice = input("\nChoice (1/2/3): ").strip()
-        
-        if choice == "1":
-            # Resume - skip existing years
-            start_year = 1975
-            years_to_process = [y for y in range(1975, 2025) if y not in existing_years]
-            print(f"\n📌 Will process {len(years_to_process)} missing years: {years_to_process[:5]}...")
-        elif choice == "2":
-            # Fresh start
-            print("\n🔄 Starting fresh from 1975 (ignoring existing data)")
-            # Clear checkpoint
-            if os.path.exists(checkpoint_file):
-                os.remove(checkpoint_file)
-                print("   Cleared checkpoint file")
-            years_to_process = list(range(1975, 2025))
-        else:
-            print("Cancelled.")
-            return
-    else:
-        # No existing data, start fresh
-        years_to_process = list(range(1975, 2025))
-        print("\n📌 Starting fresh from 1975")
-    
-    proceed = input("\nProceed? (y/n): ").strip().lower()
+    proceed = input("\nProceed with retrieval? (y/n): ").strip().lower()
     if proceed not in ['y', 'yes']:
         return
     
     start_time = datetime.now()
     
-    # Process each year
-    for year in tqdm(years_to_process, desc="Processing years") if TQDM_AVAILABLE else years_to_process:
-        try:
-            # Skip if already processed (only in resume mode, choice 1)
-            if existing_years and 'choice' in locals() and choice == "1":
-                year_file = os.path.join(progress_dir, f"pubmed_diseases_{year}.csv")
-                if os.path.exists(year_file):
-                    try:
-                        df = pd.read_csv(year_file)
-                        if len(df) > 0:
-                            logger.info(f"Skipping year {year} - already have {len(df):,} articles")
-                            continue
-                    except:
-                        pass
-            
-            # Process the year
-            smart_chunk_year(year)
-            
-        except KeyboardInterrupt:
-            print(f"\n⚠️  Interrupted at year {year}")
-            print("Progress has been saved. Run again to resume.")
-            return
-        except Exception as e:
-            logger.error(f"Failed year {year}: {e}")
-            continue
-    
-    # Combine all data
-    print("\n📊 Creating final dataset...")
-    final_df = combine_all_years()
-    
-    if final_df is not None:
-        output_file = os.path.join(data_dir, 'pubmed_disease_abstracts_1975_2024.csv')
-        final_df.to_csv(output_file, index=False, chunksize=100000)
+    # Process each condition
+    for condition in tqdm(CONDITIONS, desc="Processing conditions"):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"CONDITION: {condition}")
+        logger.info(f"{'='*60}")
         
-        duration = datetime.now() - start_time
+        condition_total_found = 0
+        condition_total_retrieved = 0
         
-        print(f"\n✅ COMPLETE!")
-        print(f"  Total articles: {len(final_df):,}")
-        print(f"  Time taken: {duration}")
-        print(f"  Output: {output_file}")
+        # Process each year for this condition
+        for year in range(1975, 2025):
+            try:
+                articles, total_found, total_retrieved = process_condition_year(condition, year)
+                condition_total_found += total_found
+                condition_total_retrieved += total_retrieved
+                
+                # Free up memory
+                del articles
+                gc.collect()
+                
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Interrupted at {condition} - {year}")
+                print("Progress has been saved. Run again to resume.")
+                generate_completeness_report()
+                return
+            except Exception as e:
+                logger.error(f"Failed {condition} - {year}: {e}")
+                continue
+        
+        logger.info(f"\nCondition Summary - {condition}:")
+        logger.info(f"  Total found: {condition_total_found:,}")
+        logger.info(f"  Total retrieved: {condition_total_retrieved:,}")
+        if condition_total_found > 0:
+            completeness = (condition_total_retrieved / condition_total_found * 100)
+            logger.info(f"  Completeness: {completeness:.1f}%")
+    
+    # Generate final completeness report
+    print("\n" + "="*80)
+    print("GENERATING FINAL REPORT")
+    print("="*80)
+    generate_completeness_report()
+    
+    duration = datetime.now() - start_time
+    print(f"\n✅ RETRIEVAL COMPLETE!")
+    print(f"  Time taken: {duration}")
+    print(f"  Data location: {data_dir}")
+    print(f"  Completeness report: {os.path.join(data_dir, 'completeness_report.txt')}")
 
 if __name__ == "__main__":
     main()

@@ -3,3 +3,6 @@ PYTHON/__pycache__/*
 .DS_Store
 ANALYSIS/*
 DATA/*
+CONDITION_DATA/*
+DOCX/*
+pubmed_condition_retrieval.log
