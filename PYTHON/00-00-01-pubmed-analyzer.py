@@ -1,39 +1,27 @@
 #!/usr/bin/env python3
 """
-ENHANCED PUBMED DATASET ANALYZER WITH IMPROVED SEARCH VALIDATION (2000-2024 FILTERED)
+00-01-RETRIEVAL-VALIDATION.py
 
-IMPROVED: Search methodology for motor neuron disease terms now properly specific
-UPDATED: Enhanced search term validation and precision testing
-ADDED: Exact phrase matching to prevent false positives
+PUBMED RETRIEVAL OUTPUT ANALYZER & QUALITY VALIDATOR
 
-Comprehensive statistical analysis of pubmed_complete_dataset.csv with enhanced
-validation statistics to help debug and improve research gap discovery search methods.
+Purpose: Comprehensive statistical analysis and validation of PubMed data 
+retrieved by 00-00-00-pubmed-mesh-data-retrieval.py script.
 
-KEY IMPROVEMENTS:
-- Motor neuron disease search terms now use exact phrase matching for specificity
-- Improved search logic to avoid false positives from overly broad terms
-- Enhanced validation with phrase-based matching instead of substring matching
-- Better term specificity checks to ensure accurate research gap analysis
-
-Features:
-- Total paper count with progress tracking
-- Year-by-year breakdown with statistics (2000-2024 only)
-- Enhanced validation with proper phrase matching
-- Fixed motor neuron disease search terms
-- Improved search methodology
-- Memory-efficient processing for large files
-- Export results to CSV and charts
+This script analyzes the condition-specific CSV files to:
+1. Validate data completeness and quality
+2. Identify retrieval gaps and biases
+3. Analyze temporal coverage and trends
+4. Assess abstract/MeSH term quality
+5. Generate confidence metrics for each condition
+6. Identify anomalies requiring re-retrieval
 
 Directory Structure:
 - Scripts: PYTHON/
-- Data: DATA/pubmed_complete_dataset.csv
-- Output: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/
+- Input: CONDITION_DATA/condition_progress/[condition]/[condition]_[year].csv
+- Output: ANALYSIS/00-01-RETRIEVAL-VALIDATION/
 
 Usage:
-    python3.11 PYTHON/00-00-01-pubmed-analyzer.py
-    
-Requirements:
-    pip install pandas numpy matplotlib seaborn tqdm tabulate
+    python3 PYTHON/00-01-RETRIEVAL-VALIDATION.py
 """
 
 import pandas as pd
@@ -42,1473 +30,1154 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import defaultdict, Counter
 import os
-import time
+import json
+import re
 from datetime import datetime
 import warnings
-import re
-import sqlite3
-from itertools import combinations
+from scipy import stats
+from pathlib import Path
+import glob
+from typing import Dict, List, Any
 
-# Try to import optional dependencies
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
-    print("📝 Note: Install tqdm for better progress bars: pip install tqdm")
-
-try:
-    from tabulate import tabulate
-    TABULATE_AVAILABLE = True
-except ImportError:
-    TABULATE_AVAILABLE = False
-    print("📝 Note: Install tabulate for better tables: pip install tabulate")
+    print("📝 Install tqdm for progress bars: pip install tqdm")
 
 warnings.filterwarnings('ignore')
 
-# Configure matplotlib for better plots
+# Configure matplotlib
 plt.style.use('default')
-plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.figsize'] = (14, 8)
 plt.rcParams['font.size'] = 10
 plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
 
-class EnhancedPubMedAnalyzer:
-    def __init__(self, file_path='pubmed_complete_dataset.csv', 
-                 min_year=2000, max_year=2024):
-        # Set up directory structure following user's hierarchy
-        self.data_dir = './DATA'
-        self.analysis_dir = './ANALYSIS'
-        self.output_dir = os.path.join(self.analysis_dir, '00-00-PUBMED-STATISTICAL-ANALYSIS')
+class PubMedRetrievalValidator:
+    def __init__(self, min_year=1975, max_year=2024):
+        """Initialize the PubMed Retrieval Validator following user's directory structure"""
         
-        # YEAR FILTERING PARAMETERS
-        self.min_year = min_year
-        self.max_year = max_year
+        # Follow user's directory structure
+        self.condition_data_dir = './CONDITION_DATA/condition_progress'
+        self.analysis_dir = './ANALYSIS'
+        self.output_dir = os.path.join(self.analysis_dir, '00-01-RETRIEVAL-VALIDATION')
         
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Set file path in DATA directory
-        if not file_path.startswith('./DATA/'):
-            self.file_path = os.path.join(self.data_dir, file_path)
-        else:
-            self.file_path = file_path
-            
-        self.results = {}
+        # Time parameters
+        self.min_year = min_year
+        self.max_year = max_year
+        self.year_range = max_year - min_year + 1
+        
+        # Storage
         self.validation_results = {}
-        self.chunk_size = 100000  # Process 100K rows at a time
+        self.condition_stats = {}
+        self.quality_scores = {}
+        self.anomalies = defaultdict(list)
+        self.retrieval_gaps = defaultdict(list)
         
-        # Check if file exists
-        if not os.path.exists(self.file_path):
-            raise FileNotFoundError(f"Cannot find {self.file_path}")
-        
-        print(f"🔍 ENHANCED PUBMED DATASET ANALYZER (FILTERED {min_year}-{max_year})")
-        print(f"🔧 IMPROVED: Search term specificity and validation methodology enhanced")
+        print(f"🔍 PUBMED RETRIEVAL OUTPUT VALIDATOR (00-01)")
         print(f"=" * 70)
-        print(f"📁 Data file: {self.file_path}")
-        print(f"📂 Output directory: {self.output_dir}")
-        print(f"📅 Year filter: {self.min_year}-{self.max_year} ONLY")
+        print(f"📁 Input: CONDITION_DATA/condition_progress/")
+        print(f"📂 Output: ANALYSIS/00-01-RETRIEVAL-VALIDATION/")
+        print(f"📅 Expected year range: {self.min_year}-{self.max_year} ({self.year_range} years)")
+        print()
         
-        # Get file info
-        file_size_gb = os.path.getsize(self.file_path) / (1024**3)
-        print(f"📊 Size: {file_size_gb:.2f} GB")
-        
-        # Quick peek at structure
-        self.preview_structure()
+        # Initial scan
+        self.available_conditions = []
+        self.scan_retrieval_outputs()
     
-    def preview_structure(self):
-        """Quick preview of file structure"""
-        print(f"\n📋 FILE STRUCTURE:")
-        try:
-            # Read just the header and first few rows
-            preview = pd.read_csv(self.file_path, nrows=3)
-            print(f"Columns: {list(preview.columns)}")
-            print(f"Sample row count: {len(preview)}")
-            
-            # Check for Year column
-            if 'Year' in preview.columns:
-                sample_years = preview['Year'].dropna().unique()
-                print(f"Sample years: {sorted(sample_years)}")
-            else:
-                print("⚠️  No 'Year' column found")
-            
-            # Check text columns for validation
-            text_columns = []
-            for col in ['MeSH_Terms', 'Title', 'Abstract', 'mesh_terms', 'title', 'abstract']:
-                if col in preview.columns:
-                    text_columns.append(col)
-            
-            print(f"Text columns available: {text_columns}")
-            
-            # Show sample content
-            for col in text_columns[:2]:  # Show first 2 text columns
-                sample_content = preview[col].dropna().iloc[0] if not preview[col].dropna().empty else "No content"
-                print(f"Sample {col}: {str(sample_content)[:100]}...")
-                
-        except Exception as e:
-            print(f"❌ Error reading file structure: {e}")
-    
-    def count_total_papers(self):
-        """Count total papers efficiently (filtered by year range)"""
-        print(f"\n📊 COUNTING TOTAL PAPERS ({self.min_year}-{self.max_year})...")
-        start_time = time.time()
+    def scan_retrieval_outputs(self):
+        """Scan and inventory all retrieved data"""
+        print("📋 SCANNING RETRIEVAL OUTPUTS...")
         
-        # Count papers within year range using chunked processing
-        total_papers_in_range = 0
-        total_papers_outside_range = 0
-        
-        try:
-            chunk_num = 0
-            for chunk in pd.read_csv(self.file_path, chunksize=self.chunk_size, 
-                                   dtype={'Year': 'str'}, low_memory=False):
-                chunk_num += 1
-                
-                if 'Year' in chunk.columns:
-                    years = pd.to_numeric(chunk['Year'], errors='coerce')
-                    
-                    # Count papers in range
-                    valid_years = years.dropna().astype(int)
-                    in_range = valid_years[(valid_years >= self.min_year) & 
-                                         (valid_years <= self.max_year)]
-                    outside_range = valid_years[(valid_years < self.min_year) | 
-                                              (valid_years > self.max_year)]
-                    
-                    total_papers_in_range += len(in_range)
-                    total_papers_outside_range += len(outside_range)
-                
-                if chunk_num % 50 == 0:
-                    print(f"   Processed {chunk_num * self.chunk_size:,} records...")
-        
-        except Exception as e:
-            print(f"❌ Error counting papers: {e}")
-            return 0
-        
-        count_time = time.time() - start_time
-        print(f"✅ Papers in range ({self.min_year}-{self.max_year}): {total_papers_in_range:,}")
-        print(f"📊 Papers outside range (excluded): {total_papers_outside_range:,}")
-        print(f"⏱️  Count time: {count_time:.1f} seconds")
-        
-        self.results['total_papers'] = total_papers_in_range
-        self.results['papers_excluded'] = total_papers_outside_range
-        return total_papers_in_range
-    
-    def analyze_years(self):
-        """Analyze year distribution using chunked processing (filtered to year range)"""
-        print(f"\n📅 ANALYZING YEAR DISTRIBUTION ({self.min_year}-{self.max_year})...")
-        
-        year_counts = defaultdict(int)
-        invalid_years = 0
-        excluded_years = 0
-        total_processed = 0
-        
-        # Progress tracking
-        if TQDM_AVAILABLE:
-            # Estimate total chunks
-            file_size = os.path.getsize(self.file_path)
-            estimated_rows = file_size // 400  # Rough estimate
-            estimated_chunks = estimated_rows // self.chunk_size
-            
-            pbar = tqdm(total=estimated_chunks, desc="Processing chunks", unit="chunk")
-        
-        start_time = time.time()
-        
-        try:
-            chunk_num = 0
-            for chunk in pd.read_csv(self.file_path, chunksize=self.chunk_size, 
-                                   dtype={'Year': 'str'}, low_memory=False):
-                
-                chunk_num += 1
-                total_processed += len(chunk)
-                
-                if TQDM_AVAILABLE:
-                    pbar.update(1)
-                    pbar.set_postfix(papers=f"{total_processed:,}")
-                else:
-                    if chunk_num % 50 == 0:  # Every 5M papers
-                        print(f"   Processed {total_processed:,} papers...")
-                
-                # Process years in this chunk
-                if 'Year' in chunk.columns:
-                    years = pd.to_numeric(chunk['Year'], errors='coerce')
-                    
-                    # Count invalid years
-                    invalid_years += years.isna().sum()
-                    
-                    # Count valid years
-                    valid_years = years.dropna().astype(int)
-                    
-                    # FILTER TO YEAR RANGE
-                    in_range_years = valid_years[(valid_years >= self.min_year) & 
-                                                (valid_years <= self.max_year)]
-                    excluded_years += len(valid_years) - len(in_range_years)
-                    
-                    # Count years only in range
-                    year_counts_chunk = in_range_years.value_counts()
-                    
-                    for year, count in year_counts_chunk.items():
-                        year_counts[year] += count
-                        
-                else:
-                    print("⚠️  No 'Year' column found in chunk")
-                    break
-            
-            if TQDM_AVAILABLE:
-                pbar.close()
-            
-            analysis_time = time.time() - start_time
-            print(f"✅ Year analysis complete")
-            print(f"⏱️  Analysis time: {analysis_time:.1f} seconds")
-            print(f"📊 Papers in range ({self.min_year}-{self.max_year}): {sum(year_counts.values()):,}")
-            print(f"📊 Papers excluded (outside range): {excluded_years:,}")
-            print(f"📊 Invalid years: {invalid_years:,}")
-            
-        except Exception as e:
-            print(f"❌ Error during year analysis: {e}")
-            return None
-        
-        # Store results
-        self.results['year_counts'] = dict(year_counts)
-        self.results['invalid_years'] = invalid_years
-        self.results['excluded_years'] = excluded_years
-        self.results['total_processed'] = total_processed
-        
-        return year_counts, invalid_years
-    
-    def analyze_mesh_terms_validation(self):
-        """Analyze MeSH terms for research gap validation (filtered by year)"""
-        print(f"\n🔍 ANALYZING MESH TERMS FOR VALIDATION ({self.min_year}-{self.max_year})...")
-        
-        mesh_term_counts = Counter()
-        total_mesh_entries = 0
-        papers_with_mesh = 0
-        mesh_term_lengths = []
-        
-        # Common problematic terms that might cause overcounting
-        common_medical_terms = {
-            'disease', 'syndrome', 'disorder', 'cancer', 'tumor', 'infection',
-            'treatment', 'therapy', 'diagnosis', 'patient', 'clinical', 'study',
-            'research', 'analysis', 'assessment', 'evaluation', 'management',
-            'neuron', 'neural', 'brain', 'cell', 'gene', 'protein', 'blood'
-        }
-        
-        common_term_counts = Counter()
-        
-        # Sample of actual MeSH content for inspection
-        mesh_samples = []
-        
-        print("   Analyzing MeSH term frequency and patterns...")
-        
-        try:
-            chunk_num = 0
-            papers_analyzed = 0
-            
-            for chunk in pd.read_csv(self.file_path, chunksize=self.chunk_size, 
-                                   dtype=str, low_memory=False):
-                chunk_num += 1
-                
-                # FILTER BY YEAR RANGE
-                if 'Year' in chunk.columns:
-                    years = pd.to_numeric(chunk['Year'], errors='coerce')
-                    year_mask = ((years >= self.min_year) & (years <= self.max_year))
-                    chunk = chunk[year_mask.fillna(False)]
-                
-                if len(chunk) == 0:
-                    continue
-                
-                # Find MeSH column (handle different naming conventions)
-                mesh_col = None
-                for col in ['MeSH_Terms', 'mesh_terms', 'MeSH', 'mesh']:
-                    if col in chunk.columns:
-                        mesh_col = col
-                        break
-                
-                if mesh_col is None:
-                    print(f"   ⚠️  No MeSH terms column found")
-                    break
-                
-                # Process MeSH terms in this chunk
-                mesh_series = chunk[mesh_col].fillna('')
-                
-                for mesh_text in mesh_series:
-                    papers_analyzed += 1
-                    if mesh_text and len(mesh_text) > 0:
-                        papers_with_mesh += 1
-                        total_mesh_entries += 1
-                        
-                        # Collect sample
-                        if len(mesh_samples) < 100:
-                            mesh_samples.append(mesh_text[:200])
-                        
-                        # Analyze individual terms
-                        mesh_text_lower = mesh_text.lower()
-                        mesh_term_lengths.append(len(mesh_text))
-                        
-                        # Split by common delimiters and analyze
-                        terms = re.split(r'[;,\|\n\r]+', mesh_text_lower)
-                        for term in terms:
-                            term = term.strip()
-                            if len(term) > 2:
-                                mesh_term_counts[term] += 1
-                                
-                                # Check for common problematic terms
-                                for common_term in common_medical_terms:
-                                    if common_term in term:
-                                        common_term_counts[common_term] += 1
-                
-                if chunk_num % 20 == 0:
-                    print(f"   Processed {papers_analyzed:,} papers in range...")
-                
-                # Limit analysis for speed
-                if papers_analyzed >= 5000000:  # Process first 5M papers for sampling
-                    break
-            
-            # Calculate statistics
-            avg_mesh_length = np.mean(mesh_term_lengths) if mesh_term_lengths else 0
-            
-            self.validation_results['mesh_analysis'] = {
-                'total_papers_analyzed': papers_analyzed,
-                'papers_with_mesh': papers_with_mesh,
-                'mesh_coverage': papers_with_mesh / papers_analyzed * 100 if papers_analyzed > 0 else 0,
-                'avg_mesh_length': avg_mesh_length,
-                'unique_mesh_terms': len(mesh_term_counts),
-                'most_common_mesh_terms': dict(mesh_term_counts.most_common(50)),
-                'common_medical_term_frequency': dict(common_term_counts.most_common(20)),
-                'mesh_samples': mesh_samples[:20]
-            }
-            
-            print(f"✅ MeSH analysis complete")
-            print(f"   Papers analyzed: {papers_analyzed:,} (filtered to {self.min_year}-{self.max_year})")
-            print(f"   Papers with MeSH: {papers_with_mesh:,} ({papers_with_mesh/papers_analyzed*100:.1f}%)")
-            print(f"   Unique terms found: {len(mesh_term_counts):,}")
-            print(f"   Average MeSH length: {avg_mesh_length:.0f} characters")
-            
-        except Exception as e:
-            print(f"❌ Error in MeSH analysis: {e}")
-    
-    def exact_phrase_search(self, text, phrase):
-        """Search for exact phrase matches with word boundaries"""
-        if not text or not phrase:
-            return False
-        
-        # Convert to lowercase for case-insensitive search
-        text_lower = text.lower()
-        phrase_lower = phrase.lower()
-        
-        # Use word boundaries to ensure exact matches
-        pattern = r'\b' + re.escape(phrase_lower) + r'\b'
-        return bool(re.search(pattern, text_lower))
-    
-    def validate_disease_search_terms(self):
-        """IMPROVED: Validate disease search terms with enhanced phrase matching"""
-        print(f"\n🧬 VALIDATING DISEASE SEARCH TERMS ({self.min_year}-{self.max_year})...")
-        print("   🔧 IMPROVED: Using exact phrase matching for better search specificity")
-        
-        # IMPROVED: Updated disease search terms with more specific phrases
-        test_diseases = {
-            # IMPROVED: Motor neuron disease now uses very specific exact phrases for better precision
-            'Motor neuron disease': [
-                'Amyotrophic Lateral Sclerosis',
-                'Motor Neuron Disease',  # Exact phrase only
-                'Lou Gehrig Disease',
-                'Lou Gehrig\'s Disease',
-                'ALS'
-            ],
-            'Diabetes mellitus': [
-                'Diabetes Mellitus, Type 2',
-                'Diabetes Mellitus, Type 1', 
-                'Diabetes Mellitus',
-                'Diabetic Nephropathies'
-            ],
-            'Breast cancer': [
-                'Breast Neoplasms',
-                'Mammary Neoplasms', 
-                'Carcinoma, Ductal, Breast',
-                'Breast Cancer'
-            ],
-            'HIV/AIDS': [
-                'HIV Infections',
-                'Acquired Immunodeficiency Syndrome',
-                'HIV-1',
-                'AIDS'
-            ],
-            'Alzheimer disease': [
-                'Alzheimer Disease',
-                'Dementia, Alzheimer Type',
-                'Alzheimer\'s Disease'
-            ],
-            'Heart disease': [
-                'Myocardial Infarction',
-                'Coronary Artery Disease',
-                'Coronary Disease',
-                'Heart Diseases'
-            ],
-            # Test cases for validation
-            'Rare genetic condition XYZ': [
-                'Nonexistent Disease ABC',
-                'Fake Syndrome XYZ'
-            ]
-        }
-        
-        validation_counts = {}
-        
-        print("   Testing disease-specific search patterns with IMPROVED exact phrase matching...")
-        
-        try:
-            # Sample a subset for validation (filtered by year)
-            sample_size = 500000  # 500K papers for speed
-            
-            print(f"   Sampling {sample_size:,} papers for validation...")
-            
-            # Read sample and filter by year
-            sample_df = pd.read_csv(self.file_path, nrows=sample_size)
-            
-            # FILTER BY YEAR RANGE
-            if 'Year' in sample_df.columns:
-                years = pd.to_numeric(sample_df['Year'], errors='coerce')
-                year_mask = ((years >= self.min_year) & (years <= self.max_year))
-                sample_df = sample_df[year_mask.fillna(False)]
-                print(f"   After year filtering: {len(sample_df):,} papers")
-            
-            # Find text columns
-            text_columns = []
-            for col in ['MeSH_Terms', 'Title', 'Abstract', 'mesh_terms', 'title', 'abstract']:
-                if col in sample_df.columns:
-                    text_columns.append(col)
-            
-            if not text_columns:
-                print("   ⚠️  No text columns found for validation")
-                return
-            
-            print(f"   Using text columns: {text_columns}")
-            
-            for disease_name, search_terms in test_diseases.items():
-                total_matches = 0
-                term_matches = {}
-                papers_with_any_match = set()
-                
-                print(f"   🔍 Testing: {disease_name}")
-                
-                for term in search_terms:
-                    matches = 0
-                    papers_with_this_term = set()
-                    
-                    for col in text_columns:
-                        if col in sample_df.columns:
-                            text_series = sample_df[col].fillna('').astype(str)
-                            
-                            # FIXED: Use exact phrase matching instead of contains
-                            for idx, text in text_series.items():
-                                if self.exact_phrase_search(text, term):
-                                    matches += 1
-                                    papers_with_this_term.add(idx)
-                    
-                    term_matches[term] = matches
-                    papers_with_any_match.update(papers_with_this_term)
-                
-                # Count unique papers (avoid double counting)
-                total_unique_matches = len(papers_with_any_match)
-                
-                # Estimate full dataset count (based on filtered papers)
-                total_papers_in_range = self.results.get('total_papers', 7453064)
-                estimated_full_count = int(total_unique_matches * (total_papers_in_range / len(sample_df))) if len(sample_df) > 0 else 0
-                
-                validation_counts[disease_name] = {
-                    'sample_matches': total_unique_matches,
-                    'estimated_full_count': estimated_full_count,
-                    'percentage_of_database': estimated_full_count / total_papers_in_range * 100 if total_papers_in_range > 0 else 0,
-                    'term_breakdown': term_matches,
-                    'search_terms_used': search_terms
-                }
-            
-            self.validation_results['disease_search_validation'] = validation_counts
-            
-            print(f"✅ Disease search validation complete")
-            print(f"\n🔍 VALIDATION RESULTS (IMPROVED SEARCH METHODOLOGY):")
-            
-            for disease, stats in validation_counts.items():
-                print(f"\n   {disease}:")
-                print(f"      Estimated papers: {stats['estimated_full_count']:,}")
-                print(f"      % of database: {stats['percentage_of_database']:.2f}%")
-                print(f"      Sample matches: {stats['sample_matches']}")
-                
-                # Updated validation thresholds
-                if disease == 'Motor neuron disease':
-                    if stats['percentage_of_database'] <= 1.0:
-                        print(f"      ✅ IMPROVED: Search specificity achieved with exact phrase matching (<1%)")
-                    elif stats['percentage_of_database'] <= 2.0:
-                        print(f"      ✅ BETTER: Good improvement with exact phrases (<2%)")
-                    elif stats['percentage_of_database'] <= 5.0:
-                        print(f"      ⚠️  IMPROVED: Significant progress but could be more specific")
-                    else:
-                        print(f"      🚨 NEEDS WORK: Search terms still too broad")
-                elif stats['percentage_of_database'] > 10:
-                    print(f"      ⚠️  SUSPICIOUS: >10% of all papers!")
-                elif stats['percentage_of_database'] > 5:
-                    print(f"      ⚠️  HIGH: >5% of all papers")
-                elif stats['estimated_full_count'] == 0:
-                    print(f"      ✅ Expected zero result")
-                else:
-                    print(f"      ✅ Reasonable count")
-        
-        except Exception as e:
-            print(f"❌ Error in disease search validation: {e}")
-    
-    def analyze_search_term_overlap(self):
-        """Analyze potential overlap between search terms (filtered by year)"""
-        print(f"\n🔄 ANALYZING SEARCH TERM OVERLAP ({self.min_year}-{self.max_year})...")
-        
-        # Common medical terms that might cause overlap
-        broad_terms = ['disease', 'syndrome', 'disorder', 'cancer', 'infection', 
-                      'treatment', 'therapy', 'patient', 'clinical', 'neural', 
-                      'brain', 'cell', 'blood', 'gene', 'protein']
-        
-        # Test exact phrase combinations that should now show better specificity
-        overlap_tests = [
-            ('Amyotrophic Lateral Sclerosis', 'Motor Neuron Disease'),  # IMPROVED: Test specific ALS terms
-            ('diabetes', 'mellitus'),
-            ('breast', 'cancer'),
-            ('heart', 'disease'),
-            ('brain', 'disease'),
-            ('neural', 'disease')
-        ]
-        
-        overlap_results = {}
-        
-        try:
-            # Sample for overlap analysis
-            sample_size = 200000
-            print(f"   Sampling {sample_size:,} papers for overlap analysis...")
-            
-            sample_df = pd.read_csv(self.file_path, nrows=sample_size)
-            
-            # FILTER BY YEAR RANGE
-            if 'Year' in sample_df.columns:
-                years = pd.to_numeric(sample_df['Year'], errors='coerce')
-                year_mask = ((years >= self.min_year) & (years <= self.max_year))
-                sample_df = sample_df[year_mask.fillna(False)]
-                print(f"   After year filtering: {len(sample_df):,} papers")
-            
-            # Find text columns
-            text_columns = []
-            for col in ['MeSH_Terms', 'Title', 'mesh_terms', 'title']:
-                if col in sample_df.columns:
-                    text_columns.append(col)
-            
-            if not text_columns:
-                print("   ⚠️  No text columns found")
-                return
-            
-            # Combine all text for analysis
-            combined_text = ""
-            for col in text_columns:
-                if col in sample_df.columns:
-                    combined_text += " " + sample_df[col].fillna('').astype(str).str.lower().str.cat(sep=' ')
-            
-            # Test broad term frequency
-            broad_term_counts = {}
-            for term in broad_terms:
-                count = combined_text.count(term.lower())
-                broad_term_counts[term] = count
-                
-            # Test overlap combinations with improved matching
-            for term1, term2 in overlap_tests:
-                both_count = 0
-                term1_only = 0
-                term2_only = 0
-                
-                for col in text_columns:
-                    if col in sample_df.columns:
-                        text_series = sample_df[col].fillna('').astype(str)
-                        
-                        # Use exact phrase matching for specific terms
-                        if term1 in ['Amyotrophic Lateral Sclerosis', 'Motor Neuron Disease']:
-                            has_term1 = text_series.apply(lambda x: self.exact_phrase_search(x, term1))
-                        else:
-                            has_term1 = text_series.str.lower().str.contains(term1.lower(), regex=False)
-                            
-                        if term2 in ['Amyotrophic Lateral Sclerosis', 'Motor Neuron Disease']:
-                            has_term2 = text_series.apply(lambda x: self.exact_phrase_search(x, term2))
-                        else:
-                            has_term2 = text_series.str.lower().str.contains(term2.lower(), regex=False)
-                        
-                        both_count += (has_term1 & has_term2).sum()
-                        term1_only += (has_term1 & ~has_term2).sum()
-                        term2_only += (~has_term1 & has_term2).sum()
-                
-                overlap_results[f"{term1}+{term2}"] = {
-                    'both_terms': both_count,
-                    'term1_only': term1_only,
-                    'term2_only': term2_only,
-                    'overlap_percentage': both_count / max(1, both_count + term1_only + term2_only) * 100
-                }
-            
-            self.validation_results['search_overlap_analysis'] = {
-                'broad_term_frequency': broad_term_counts,
-                'term_overlap_results': overlap_results,
-                'sample_size': len(sample_df)
-            }
-            
-            print(f"✅ Overlap analysis complete")
-            print(f"\n📊 BROAD TERM FREQUENCIES (sample):")
-            for term, count in sorted(broad_term_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
-                print(f"   '{term}': {count:,} occurrences")
-            
-            print(f"\n🔄 TERM OVERLAP ANALYSIS:")
-            for combo, stats in overlap_results.items():
-                if "Amyotrophic Lateral Sclerosis" in combo:
-                    print(f"   {combo}: {stats['both_terms']} papers with both terms ({stats['overlap_percentage']:.1f}% overlap) - IMPROVED exact phrase matching")
-                else:
-                    print(f"   {combo}: {stats['both_terms']} papers with both terms ({stats['overlap_percentage']:.1f}% overlap)")
-        
-        except Exception as e:
-            print(f"❌ Error in overlap analysis: {e}")
-    
-    def generate_validation_recommendations(self):
-        """Generate recommendations based on improved search validation results"""
-        print(f"\n💡 GENERATING VALIDATION RECOMMENDATIONS...")
-        
-        recommendations = []
-        issues_found = []
-        improvements_confirmed = []
-        
-        # Analyze validation results
-        if 'disease_search_validation' in self.validation_results:
-            disease_validation = self.validation_results['disease_search_validation']
-            
-            for disease, stats in disease_validation.items():
-                if disease == 'Motor neuron disease':
-                    if stats['percentage_of_database'] <= 1.0:
-                        improvements_confirmed.append(f"✅ IMPROVED: '{disease}' search now shows {stats['percentage_of_database']:.1f}% (was 20.1%) - exact phrase matching effective!")
-                        recommendations.append(f"SUCCESS: Motor neuron disease search improved using exact phrase matching")
-                    elif stats['percentage_of_database'] <= 2.0:
-                        improvements_confirmed.append(f"✅ BETTER: '{disease}' search reduced to {stats['percentage_of_database']:.1f}% (was 20.1%) - significant improvement")
-                        recommendations.append(f"GOOD PROGRESS: Motor neuron disease search much improved with phrase matching")
-                    elif stats['percentage_of_database'] <= 5.0:
-                        improvements_confirmed.append(f"⚠️ PARTIAL: '{disease}' search reduced to {stats['percentage_of_database']:.1f}% (was 20.1%) - some progress")
-                        recommendations.append(f"PARTIAL SUCCESS: Motor neuron disease search improved but could be more specific")
-                    else:
-                        issues_found.append(f"🚨 STILL BROAD: '{disease}' search matches {stats['percentage_of_database']:.1f}% of all papers")
-                        recommendations.append(f"CRITICAL: Motor neuron disease search terms still need refinement")
-                elif stats['percentage_of_database'] > 10:
-                    issues_found.append(f"'{disease}' matches {stats['percentage_of_database']:.1f}% of all papers")
-                    recommendations.append(f"CRITICAL: Review search terms for '{disease}' - use more specific MeSH terms")
-                elif stats['percentage_of_database'] > 5:
-                    issues_found.append(f"'{disease}' matches {stats['percentage_of_database']:.1f}% of all papers")
-                    recommendations.append(f"WARNING: '{disease}' search terms may be too broad")
-        
-        # Check MeSH analysis
-        if 'mesh_analysis' in self.validation_results:
-            mesh_data = self.validation_results['mesh_analysis']
-            common_terms = mesh_data.get('common_medical_term_frequency', {})
-            
-            for term, count in common_terms.items():
-                if count > 100000:  # Very frequent terms
-                    recommendations.append(f"AVOID using '{term}' alone - appears in {count:,} papers")
-        
-        # Updated recommendations showing successful search methodology improvements
-        recommendations.extend([
-            f"YEAR FILTERING: Only analyze papers from {self.min_year}-{self.max_year} (excludes {self.results.get('excluded_years', 0):,} outliers)",
-            "✅ EXACT PHRASE MATCHING: Use word boundaries and exact phrases instead of substring matching",
-            "✅ SEARCH SPECIFICITY: Use exact phrases like 'Amyotrophic Lateral Sclerosis', 'Motor Neuron Disease' with word boundaries",
-            "AVOID SUBSTRING MATCHING: Don't use broad contains() - use exact phrase matching with word boundaries",
-            "USE SPECIFIC MESH TERMS: Follow improved motor neuron disease example - exact disease names only",
-            "COMBINE TERMS WITH AND: Use exact phrases combined with AND logic",
-            "CHECK PHRASE SPECIFICITY: Exact phrases prevent false positives from partial matches",
-            "VALIDATE WITH SAMPLES: Always test exact phrase matching with small samples first",
-            "IMPLEMENT WORD BOUNDARIES: Use \\b regex boundaries to ensure complete words/phrases only",
-            "TEST PHRASE COMBINATIONS: Verify that exact phrases don't overlap inappropriately"
-        ])
-        
-        self.validation_results['recommendations'] = {
-            'issues_found': issues_found,
-            'improvements_confirmed': improvements_confirmed,
-            'recommendations': recommendations
-        }
-        
-        print(f"✅ Recommendations generated")
-        
-        if improvements_confirmed:
-            print(f"\n🎉 SEARCH METHODOLOGY IMPROVEMENTS CONFIRMED:")
-            for improvement in improvements_confirmed:
-                print(f"   {improvement}")
-        
-        if issues_found:
-            print(f"\n🚨 REMAINING ISSUES:")
-            for issue in issues_found:
-                print(f"   • {issue}")
-        else:
-            print(f"\n✅ NO CRITICAL ISSUES FOUND - All validations passed!")
-        
-        print(f"\n💡 RECOMMENDED BEST PRACTICES (UPDATED):")
-        for i, rec in enumerate(recommendations, 1):
-            print(f"   {i}. {rec}")
-    
-    def calculate_statistics(self):
-        """Calculate comprehensive statistics (only for filtered year range)"""
-        print(f"\n📊 CALCULATING STATISTICS ({self.min_year}-{self.max_year})...")
-        
-        year_counts = self.results.get('year_counts', {})
-        if not year_counts:
-            print("❌ No year data available for statistics")
+        if not os.path.exists(self.condition_data_dir):
+            print(f"❌ Directory not found: {self.condition_data_dir}")
+            print(f"   Please run 00-00-00-pubmed-mesh-data-retrieval.py first")
             return
         
-        # Basic statistics (already filtered)
-        total_valid = sum(year_counts.values())
-        invalid_years = self.results.get('invalid_years', 0)
-        excluded_years = self.results.get('excluded_years', 0)
+        # Scan all condition folders
+        condition_summary = []
         
-        earliest_year = min(year_counts.keys()) if year_counts else self.min_year
-        latest_year = max(year_counts.keys()) if year_counts else self.max_year
+        for condition_folder in sorted(os.listdir(self.condition_data_dir)):
+            condition_path = os.path.join(self.condition_data_dir, condition_folder)
+            
+            if os.path.isdir(condition_path):
+                csv_files = glob.glob(os.path.join(condition_path, "*.csv"))
+                
+                if csv_files:
+                    # Extract years from filenames
+                    years_found = []
+                    total_size_mb = 0
+                    
+                    for csv_file in csv_files:
+                        # Get file size
+                        size_mb = os.path.getsize(csv_file) / (1024 * 1024)
+                        total_size_mb += size_mb
+                        
+                        # Extract year from filename
+                        year_match = re.search(r'_(\d{4})\.csv$', csv_file)
+                        if year_match:
+                            years_found.append(int(year_match.group(1)))
+                    
+                    self.available_conditions.append(condition_folder)
+                    
+                    condition_summary.append({
+                        'condition': condition_folder,
+                        'num_files': len(csv_files),
+                        'years_found': sorted(years_found),
+                        'year_coverage': len(years_found) / self.year_range * 100,
+                        'total_size_mb': total_size_mb,
+                        'min_year': min(years_found) if years_found else None,
+                        'max_year': max(years_found) if years_found else None
+                    })
         
-        # Calculate decade summaries (only for filtered range)
-        decade_totals = defaultdict(int)
-        for year, count in year_counts.items():
-            decade = (year // 10) * 10
-            decade_totals[decade] += count
+        # Store summary
+        self.retrieval_summary = pd.DataFrame(condition_summary)
         
-        # Recent years analysis (2020-2024)
-        recent_years = sum(count for year, count in year_counts.items() 
-                          if year >= 2020 and year <= 2024)
-        
-        # Growth analysis
-        sorted_years = sorted(year_counts.items())
-        if len(sorted_years) >= 10:
-            # Calculate average annual growth (last 10 years vs first 10 years)
-            early_avg = np.mean([count for year, count in sorted_years[:10]])
-            late_avg = np.mean([count for year, count in sorted_years[-10:]])
-            growth_factor = late_avg / early_avg if early_avg > 0 else 0
+        if not self.retrieval_summary.empty:
+            print(f"✅ Found {len(self.available_conditions)} conditions")
+            print(f"   Total files: {self.retrieval_summary['num_files'].sum():,}")
+            print(f"   Total size: {self.retrieval_summary['total_size_mb'].sum():.1f} MB")
+            print(f"   Average year coverage: {self.retrieval_summary['year_coverage'].mean():.1f}%")
+            
+            # Show conditions with best/worst coverage
+            best = self.retrieval_summary.nlargest(5, 'year_coverage')
+            worst = self.retrieval_summary.nsmallest(5, 'year_coverage')
+            
+            print(f"\n📊 BEST COVERAGE:")
+            for _, row in best.iterrows():
+                clean_name = row['condition'].replace('_', ' ')
+                print(f"   {clean_name}: {row['year_coverage']:.1f}% ({row['num_files']} files)")
+            
+            print(f"\n⚠️  WORST COVERAGE:")
+            for _, row in worst.iterrows():
+                clean_name = row['condition'].replace('_', ' ')
+                print(f"   {clean_name}: {row['year_coverage']:.1f}% ({row['num_files']} files)")
         else:
-            growth_factor = 0
+            print("❌ No data found!")
+    
+    def analyze_condition_completeness(self, condition: str) -> Dict:
+        """Analyze completeness and quality for a specific condition"""
         
-        # Store comprehensive statistics
+        condition_path = os.path.join(self.condition_data_dir, condition)
+        if not os.path.exists(condition_path):
+            return {}
+        
         stats = {
-            'total_valid_papers': total_valid,
-            'invalid_years': invalid_years,
-            'excluded_years': excluded_years,
-            'year_range': (earliest_year, latest_year),
-            'total_years': latest_year - earliest_year + 1,
-            'decade_totals': dict(decade_totals),
-            'recent_years_2020_2024': recent_years,
-            'growth_factor_10yr': growth_factor,
-            'average_per_year': total_valid / (latest_year - earliest_year + 1),
-            'data_completeness': total_valid / (total_valid + invalid_years) * 100 if (total_valid + invalid_years) > 0 else 0,
-            'year_filter_applied': f"{self.min_year}-{self.max_year}"
+            'condition': condition,
+            'years': {},
+            'total_papers': 0,
+            'papers_with_abstracts': 0,
+            'papers_with_mesh': 0,
+            'missing_years': [],
+            'anomalous_years': [],
+            'quality_issues': [],
+            'duplicate_pmids': 0,
+            'unique_pmids': set()
         }
         
-        self.results['statistics'] = stats
+        # Expected years
+        expected_years = set(range(self.min_year, self.max_year + 1))
+        found_years = set()
+        
+        # Analyze each year file
+        for year in range(self.min_year, self.max_year + 1):
+            file_path = os.path.join(condition_path, f"{condition}_{year}.csv")
+            
+            if os.path.exists(file_path):
+                try:
+                    df = pd.read_csv(file_path)
+                    found_years.add(year)
+                    
+                    # Basic statistics
+                    n_papers = len(df)
+                    n_abstracts = (~df['Abstract'].isna()).sum() if 'Abstract' in df.columns else 0
+                    n_mesh = (~df['MeSH_Terms'].isna()).sum() if 'MeSH_Terms' in df.columns else 0
+                    
+                    # Quality checks
+                    abstract_rate = n_abstracts / n_papers * 100 if n_papers > 0 else 0
+                    mesh_rate = n_mesh / n_papers * 100 if n_papers > 0 else 0
+                    
+                    # Check for duplicates within year
+                    n_duplicates = 0
+                    if 'PMID' in df.columns:
+                        n_duplicates = df.duplicated(subset=['PMID']).sum()
+                        # Track unique PMIDs across all years
+                        stats['unique_pmids'].update(df['PMID'].dropna().astype(str))
+                    
+                    # Check for meaningful abstracts (not just "[No abstract available]" etc.)
+                    meaningful_abstracts = 0
+                    if 'Abstract' in df.columns:
+                        abstract_series = df['Abstract'].dropna()
+                        meaningful_abstracts = sum(1 for a in abstract_series 
+                                                  if len(str(a)) > 100 and 
+                                                  'no abstract' not in str(a).lower())
+                        avg_abstract_len = abstract_series.str.len().mean() if len(abstract_series) > 0 else 0
+                    else:
+                        avg_abstract_len = 0
+                    
+                    year_stats = {
+                        'papers': n_papers,
+                        'abstracts': n_abstracts,
+                        'meaningful_abstracts': meaningful_abstracts,
+                        'abstract_rate': abstract_rate,
+                        'mesh_terms': n_mesh,
+                        'mesh_rate': mesh_rate,
+                        'duplicates': n_duplicates,
+                        'avg_abstract_length': avg_abstract_len
+                    }
+                    
+                    stats['years'][year] = year_stats
+                    stats['total_papers'] += n_papers
+                    stats['papers_with_abstracts'] += meaningful_abstracts
+                    stats['papers_with_mesh'] += n_mesh
+                    stats['duplicate_pmids'] += n_duplicates
+                    
+                    # Flag quality issues
+                    if n_papers == 0:
+                        stats['quality_issues'].append(f"Year {year}: Empty file")
+                    elif abstract_rate < 50:
+                        stats['quality_issues'].append(f"Year {year}: Low abstract rate ({abstract_rate:.1f}%)")
+                    elif n_duplicates > n_papers * 0.05:  # More than 5% duplicates
+                        stats['quality_issues'].append(f"Year {year}: High duplicates ({n_duplicates}/{n_papers})")
+                    
+                except Exception as e:
+                    stats['quality_issues'].append(f"Year {year}: Error reading file - {str(e)}")
+            else:
+                stats['missing_years'].append(year)
+        
+        # Calculate missing years
+        stats['missing_years'] = sorted(list(expected_years - found_years))
+        stats['year_coverage'] = len(found_years) / len(expected_years) * 100
+        stats['unique_pmid_count'] = len(stats['unique_pmids'])
+        
+        # Check for cross-year duplicates
+        if stats['total_papers'] > 0 and stats['unique_pmid_count'] > 0:
+            stats['cross_year_duplicate_rate'] = (stats['total_papers'] - stats['unique_pmid_count']) / stats['total_papers'] * 100
+        else:
+            stats['cross_year_duplicate_rate'] = 0
+        
+        # Detect anomalous years (statistical outliers)
+        if len(stats['years']) > 5:
+            paper_counts = [y['papers'] for y in stats['years'].values() if y['papers'] > 0]
+            if paper_counts:
+                q1 = np.percentile(paper_counts, 25)
+                q3 = np.percentile(paper_counts, 75)
+                iqr = q3 - q1
+                lower_bound = max(0, q1 - 1.5 * iqr)
+                upper_bound = q3 + 1.5 * iqr
+                
+                for year, year_stats in stats['years'].items():
+                    if year_stats['papers'] > 0 and (year_stats['papers'] < lower_bound or year_stats['papers'] > upper_bound):
+                        stats['anomalous_years'].append({
+                            'year': year,
+                            'papers': year_stats['papers'],
+                            'reason': f'Outlier (expected {lower_bound:.0f}-{upper_bound:.0f})'
+                        })
+        
+        # Calculate overall quality score
+        quality_score = self.calculate_quality_score(stats)
+        stats['quality_score'] = quality_score
+        
         return stats
     
-    def display_results(self):
-        """Display comprehensive results with validation insights"""
-        print(f"\n" + "="*80)
-        print(f"📊 ENHANCED PUBMED DATASET ANALYSIS RESULTS ({self.min_year}-{self.max_year})")
-        print(f"🔧 IMPROVED: Search term specificity and validation methodology enhanced")
-        print(f"="*80)
+    def calculate_quality_score(self, stats: Dict) -> float:
+        """Calculate a quality score for the condition data"""
         
-        # Basic info
-        total_papers = self.results.get('total_papers', 'Unknown')
-        excluded_papers = self.results.get('excluded_years', 0)
-        stats = self.results.get('statistics', {})
-        year_counts = self.results.get('year_counts', {})
+        score = 100.0
         
-        print(f"\n🔢 BASIC STATISTICS:")
-        print(f"   Papers in analysis range ({self.min_year}-{self.max_year}): {total_papers:,}")
-        print(f"   Papers excluded (outside range): {excluded_papers:,}")
-        print(f"   Invalid/missing years: {stats.get('invalid_years', 0):,}")
-        print(f"   Data completeness: {stats.get('data_completeness', 0):.1f}%")
+        # Penalize for missing years (max -30 points)
+        missing_penalty = min(30, len(stats['missing_years']) * 0.6)
+        score -= missing_penalty
         
-        # Year range
-        year_range = stats.get('year_range', (0, 0))
-        print(f"\n📅 TEMPORAL COVERAGE:")
-        print(f"   Year range analyzed: {year_range[0]} - {year_range[1]}")
-        print(f"   Total years: {stats.get('total_years', 0)}")
-        print(f"   Average per year: {stats.get('average_per_year', 0):,.0f}")
+        # Penalize for low abstract coverage (max -25 points)
+        if stats['total_papers'] > 0:
+            abstract_rate = stats['papers_with_abstracts'] / stats['total_papers'] * 100
+            if abstract_rate < 70:
+                score -= (70 - abstract_rate) * 0.35
         
-        # Recent years analysis
-        print(f"\n🕐 ERA ANALYSIS:")
-        print(f"   Recent (2020-2024): {stats.get('recent_years_2020_2024', 0):,} papers")
+        # Penalize for low MeSH coverage (max -20 points)
+        if stats['total_papers'] > 0:
+            mesh_rate = stats['papers_with_mesh'] / stats['total_papers'] * 100
+            if mesh_rate < 70:
+                score -= (70 - mesh_rate) * 0.28
         
-        # Growth factor
-        growth_factor = stats.get('growth_factor_10yr', 0)
-        if growth_factor > 0:
-            print(f"   10-year growth factor: {growth_factor:.1f}x")
+        # Penalize for cross-year duplicates (max -10 points)
+        if stats.get('cross_year_duplicate_rate', 0) > 5:
+            score -= min(10, stats['cross_year_duplicate_rate'] * 0.5)
         
-        # Display filtering information
-        print(f"\n🔍 FILTERING APPLIED:")
-        print(f"   Papers included: {total_papers:,} ({self.min_year}-{self.max_year})")
-        print(f"   Papers excluded: {excluded_papers:,} (outside range)")
+        # Penalize for quality issues (max -10 points)
+        issue_penalty = min(10, len(stats['quality_issues']) * 2)
+        score -= issue_penalty
         
-        # Display validation results with improvement status
-        if self.validation_results:
-            print(f"\n" + "="*80)
-            print(f"🔍 RESEARCH GAP DISCOVERY VALIDATION RESULTS")
-            print(f"🔧 IMPROVED: Exact phrase matching implemented for better search precision")
-            print(f"="*80)
+        # Penalize for anomalous years (max -5 points)
+        anomaly_penalty = min(5, len(stats['anomalous_years']) * 1)
+        score -= anomaly_penalty
+        
+        return max(0, score)
+    
+    def analyze_temporal_patterns(self):
+        """Analyze temporal patterns across all conditions"""
+        print(f"\n📈 ANALYZING TEMPORAL PATTERNS...")
+        
+        temporal_data = defaultdict(lambda: defaultdict(int))
+        
+        for condition in tqdm(self.available_conditions, desc="Processing conditions"):
+            condition_path = os.path.join(self.condition_data_dir, condition)
             
-            # Show successful improvements first
-            if 'recommendations' in self.validation_results:
-                rec_data = self.validation_results['recommendations']
-                if rec_data.get('improvements_confirmed'):
-                    print(f"\n🎉 SEARCH METHODOLOGY IMPROVEMENTS:")
-                    for improvement in rec_data['improvements_confirmed']:
-                        print(f"   {improvement}")
-            
-            # Disease search validation
-            if 'disease_search_validation' in self.validation_results:
-                print(f"\n🧬 DISEASE SEARCH VALIDATION (IMPROVED METHODOLOGY):")
-                disease_validation = self.validation_results['disease_search_validation']
+            for year in range(self.min_year, self.max_year + 1):
+                file_path = os.path.join(condition_path, f"{condition}_{year}.csv")
                 
-                for disease, stats in disease_validation.items():
-                    if disease == 'Motor neuron disease':
-                        if stats['percentage_of_database'] <= 1.0:
-                            status = "✅ IMPROVED"
-                        elif stats['percentage_of_database'] <= 2.0:
-                            status = "✅ BETTER"
-                        elif stats['percentage_of_database'] <= 5.0:
-                            status = "⚠️ PARTIAL"
-                        else:
-                            status = "🚨 STILL BROAD"
-                    elif stats['percentage_of_database'] > 5:
-                        status = "🚨 SUSPICIOUS"
-                    else:
-                        status = "✅ REASONABLE"
-                    
-                    print(f"   {disease}: {stats['estimated_full_count']:,} papers ({stats['percentage_of_database']:.2f}%) {status}")
+                if os.path.exists(file_path):
+                    try:
+                        df = pd.read_csv(file_path, nrows=1)  # Just get count
+                        # Read again to get actual count
+                        with open(file_path, 'r') as f:
+                            line_count = sum(1 for line in f) - 1  # Subtract header
+                        temporal_data[year][condition] = max(0, line_count)
+                    except:
+                        temporal_data[year][condition] = 0
+        
+        # Convert to DataFrame
+        self.temporal_df = pd.DataFrame(temporal_data).T
+        self.temporal_df = self.temporal_df.fillna(0).astype(int)
+        
+        # Calculate aggregate statistics
+        self.temporal_stats = {
+            'total_by_year': self.temporal_df.sum(axis=1).to_dict(),
+            'mean_by_year': self.temporal_df.mean(axis=1).to_dict(),
+            'std_by_year': self.temporal_df.std(axis=1).to_dict(),
+            'active_conditions_by_year': (self.temporal_df > 0).sum(axis=1).to_dict()
+        }
+        
+        # Identify trends
+        years = sorted(self.temporal_stats['total_by_year'].keys())
+        totals = [self.temporal_stats['total_by_year'][y] for y in years]
+        
+        if len(years) > 1:
+            # Calculate growth rate
+            if len(totals) >= 10:
+                early_period = totals[:5]
+                late_period = totals[-5:]
+            else:
+                early_period = totals[:len(totals)//2]
+                late_period = totals[len(totals)//2:]
             
-            # MeSH analysis summary
-            if 'mesh_analysis' in self.validation_results:
-                mesh_data = self.validation_results['mesh_analysis']
-                print(f"\n📝 MESH TERMS ANALYSIS:")
-                print(f"   Papers with MeSH: {mesh_data['papers_with_mesh']:,} ({mesh_data['mesh_coverage']:.1f}%)")
-                print(f"   Unique terms: {mesh_data['unique_mesh_terms']:,}")
-                print(f"   Avg MeSH length: {mesh_data['avg_mesh_length']:.0f} characters")
+            early_avg = np.mean(early_period) if early_period else 0
+            late_avg = np.mean(late_period) if late_period else 0
+            growth_rate = ((late_avg - early_avg) / early_avg * 100) if early_avg > 0 else 0
             
-            # Show status
-            if 'recommendations' in self.validation_results:
-                rec_data = self.validation_results['recommendations']
-                if not rec_data['issues_found']:
-                    print(f"\n✅ ALL VALIDATIONS PASSED - Search methodology improvements successful!")
-                else:
-                    print(f"\n🚨 REMAINING SEARCH METHODOLOGY ISSUES:")
-                    for issue in rec_data['issues_found'][:3]:
-                        print(f"   • {issue}")
+            # Fit linear trend
+            from scipy import stats as scipy_stats
+            slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(years, totals)
+            
+            self.temporal_stats['growth_rate'] = growth_rate
+            self.temporal_stats['trend_slope'] = slope
+            self.temporal_stats['trend_r2'] = r_value ** 2
+            self.temporal_stats['trend_p_value'] = p_value
+            
+            print(f"   Total papers across all conditions: {sum(totals):,}")
+            print(f"   Average annual growth: {growth_rate:.1f}%")
+            print(f"   Trend R²: {r_value**2:.3f}")
+            print(f"   Trend significant: {'Yes' if p_value < 0.05 else 'No'} (p={p_value:.4f})")
+    
+    def identify_data_gaps(self):
+        """Identify systematic gaps in the data"""
+        print(f"\n🔍 IDENTIFYING DATA GAPS...")
+        
+        gaps = {
+            'missing_years': defaultdict(list),
+            'low_coverage_years': defaultdict(list),
+            'suspicious_patterns': [],
+            'incomplete_conditions': [],
+            'empty_files': []
+        }
+        
+        for condition in self.available_conditions:
+            stats = self.condition_stats.get(condition, {})
+            
+            # Missing years
+            if stats.get('missing_years'):
+                gaps['missing_years'][condition] = stats['missing_years']
+            
+            # Low coverage years
+            for year, year_stats in stats.get('years', {}).items():
+                if year_stats['papers'] == 0:
+                    gaps['empty_files'].append({'condition': condition, 'year': year})
+                elif year_stats['abstract_rate'] < 50:
+                    gaps['low_coverage_years'][condition].append({
+                        'year': year,
+                        'abstract_rate': year_stats['abstract_rate'],
+                        'papers': year_stats['papers']
+                    })
+            
+            # Incomplete conditions
+            if stats.get('year_coverage', 100) < 80:
+                gaps['incomplete_conditions'].append({
+                    'condition': condition,
+                    'coverage': stats.get('year_coverage', 0),
+                    'missing_years': len(stats.get('missing_years', [])),
+                    'total_papers': stats.get('total_papers', 0)
+                })
+        
+        # Check for systematic year gaps across conditions
+        year_gap_counts = defaultdict(int)
+        for condition, missing_years in gaps['missing_years'].items():
+            for year in missing_years:
+                year_gap_counts[year] += 1
+        
+        # Years missing for many conditions (>20% of conditions)
+        systematic_gaps = {year: count for year, count in year_gap_counts.items() 
+                          if count > len(self.available_conditions) * 0.2}
+        
+        if systematic_gaps:
+            gaps['suspicious_patterns'].append({
+                'type': 'Systematic year gaps',
+                'details': systematic_gaps,
+                'description': 'Years with missing data for >20% of conditions'
+            })
+        
+        self.data_gaps = gaps
+        
+        # Report findings
+        print(f"   Conditions with missing years: {len(gaps['missing_years'])}")
+        print(f"   Incomplete conditions (<80% coverage): {len(gaps['incomplete_conditions'])}")
+        print(f"   Empty files found: {len(gaps['empty_files'])}")
+        
+        if systematic_gaps:
+            print(f"\n   ⚠️  SYSTEMATIC GAPS DETECTED:")
+            for year, count in sorted(systematic_gaps.items(), key=lambda x: x[1], reverse=True)[:5]:
+                pct = count/len(self.available_conditions)*100
+                print(f"      Year {year}: Missing for {count} conditions ({pct:.1f}%)")
+    
+    def analyze_mesh_quality(self):
+        """Analyze MeSH term quality and coverage"""
+        print(f"\n🏷️  ANALYZING MESH TERM QUALITY...")
+        
+        mesh_stats = {
+            'coverage_by_condition': {},
+            'unique_terms_total': set(),
+            'term_frequency': Counter(),
+            'terms_per_paper': [],
+            'top_terms_by_condition': {}
+        }
+        
+        # Sample conditions for detailed analysis
+        sample_size = min(30, len(self.available_conditions))
+        sample_conditions = np.random.choice(self.available_conditions, sample_size, replace=False)
+        
+        for condition in tqdm(sample_conditions, desc="Analyzing MeSH"):
+            condition_path = os.path.join(self.condition_data_dir, condition)
+            condition_mesh_terms = set()
+            condition_term_freq = Counter()
+            papers_with_mesh = 0
+            total_papers = 0
+            
+            # Sample recent years for better quality assessment
+            sample_years = [2015, 2018, 2020, 2022, 2024]
+            
+            for year in sample_years:
+                file_path = os.path.join(condition_path, f"{condition}_{year}.csv")
+                
+                if os.path.exists(file_path):
+                    try:
+                        df = pd.read_csv(file_path)
+                        total_papers += len(df)
+                        
+                        if 'MeSH_Terms' in df.columns:
+                            mesh_data = df['MeSH_Terms'].dropna()
+                            papers_with_mesh += len(mesh_data)
+                            
+                            for mesh_str in mesh_data:
+                                terms = str(mesh_str).split(';')
+                                terms = [t.strip() for t in terms if t.strip()]
+                                condition_mesh_terms.update(terms)
+                                condition_term_freq.update(terms)
+                                mesh_stats['term_frequency'].update(terms)
+                                mesh_stats['terms_per_paper'].append(len(terms))
+                    except:
+                        pass
+            
+            if total_papers > 0:
+                mesh_stats['coverage_by_condition'][condition] = {
+                    'coverage': papers_with_mesh / total_papers * 100,
+                    'unique_terms': len(condition_mesh_terms),
+                    'avg_terms_per_paper': np.mean([len(t) for t in condition_term_freq.elements()]) if condition_term_freq else 0
+                }
+                mesh_stats['unique_terms_total'].update(condition_mesh_terms)
+                mesh_stats['top_terms_by_condition'][condition] = condition_term_freq.most_common(10)
+        
+        # Calculate overall statistics
+        if mesh_stats['coverage_by_condition']:
+            coverages = [v['coverage'] for v in mesh_stats['coverage_by_condition'].values()]
+            mesh_stats['mean_coverage'] = np.mean(coverages)
+            mesh_stats['std_coverage'] = np.std(coverages)
+            mesh_stats['total_unique_terms'] = len(mesh_stats['unique_terms_total'])
+            
+            if mesh_stats['terms_per_paper']:
+                mesh_stats['mean_terms_per_paper'] = np.mean(mesh_stats['terms_per_paper'])
+                mesh_stats['median_terms_per_paper'] = np.median(mesh_stats['terms_per_paper'])
+            
+            print(f"   Mean MeSH coverage: {mesh_stats['mean_coverage']:.1f}% (±{mesh_stats['std_coverage']:.1f}%)")
+            print(f"   Total unique MeSH terms: {mesh_stats['total_unique_terms']:,}")
+            print(f"   Mean terms per paper: {mesh_stats.get('mean_terms_per_paper', 0):.1f}")
+            print(f"   Median terms per paper: {mesh_stats.get('median_terms_per_paper', 0):.1f}")
+            
+            # Top MeSH terms overall
+            print(f"\n   TOP MESH TERMS OVERALL:")
+            for term, count in mesh_stats['term_frequency'].most_common(10):
+                print(f"      {term}: {count:,}")
+        
+        self.mesh_stats = mesh_stats
+    
+    def generate_confidence_scores(self):
+        """Generate confidence scores for each condition"""
+        print(f"\n🎯 GENERATING CONFIDENCE SCORES...")
+        
+        for condition in tqdm(self.available_conditions, desc="Scoring conditions"):
+            stats = self.analyze_condition_completeness(condition)
+            self.condition_stats[condition] = stats
+            self.quality_scores[condition] = stats['quality_score']
+        
+        # Categorize by confidence level
+        high_confidence = [c for c, s in self.quality_scores.items() if s >= 80]
+        medium_confidence = [c for c, s in self.quality_scores.items() if 60 <= s < 80]
+        low_confidence = [c for c, s in self.quality_scores.items() if s < 60]
+        
+        print(f"\n📊 CONFIDENCE DISTRIBUTION:")
+        print(f"   High (≥80): {len(high_confidence)} conditions")
+        print(f"   Medium (60-79): {len(medium_confidence)} conditions")
+        print(f"   Low (<60): {len(low_confidence)} conditions")
+        
+        # Show examples from each category
+        if high_confidence:
+            print(f"\n✅ HIGH CONFIDENCE CONDITIONS (examples):")
+            for condition in sorted(high_confidence, key=lambda x: self.quality_scores[x], reverse=True)[:5]:
+                clean_name = condition.replace('_', ' ')
+                print(f"   {clean_name}: {self.quality_scores[condition]:.1f}")
+        
+        if low_confidence:
+            print(f"\n⚠️  LOW CONFIDENCE CONDITIONS (need attention):")
+            for condition in sorted(low_confidence, key=lambda x: self.quality_scores[x])[:10]:
+                clean_name = condition.replace('_', ' ')
+                score = self.quality_scores[condition]
+                stats = self.condition_stats[condition]
+                print(f"   {clean_name}: {score:.1f}")
+                if stats['missing_years']:
+                    print(f"      Missing {len(stats['missing_years'])} years")
+                if stats.get('cross_year_duplicate_rate', 0) > 5:
+                    print(f"      Cross-year duplicates: {stats['cross_year_duplicate_rate']:.1f}%")
     
     def create_validation_visualizations(self):
-        """Create validation visualizations showing search methodology improvements"""
+        """Create comprehensive validation visualizations"""
         print(f"\n📊 CREATING VALIDATION VISUALIZATIONS...")
         
-        if not self.validation_results:
-            print("❌ No validation results for visualization")
-            return
-        
-        # Create comprehensive validation plot
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f'PubMed Dataset Search Precision Analysis - Exact Phrase Methodology ({self.min_year}-{self.max_year})', 
-                    fontsize=14, fontweight='bold')
-        
-        # 1. Disease search validation results
-        if 'disease_search_validation' in self.validation_results:
-            ax1 = axes[0, 0]
-            disease_validation = self.validation_results['disease_search_validation']
-            
-            diseases = list(disease_validation.keys())
-            percentages = [stats['percentage_of_database'] for stats in disease_validation.values()]
-            
-            bars = ax1.barh(diseases, percentages)
-            ax1.set_xlabel('% of Total Database')
-            ax1.set_title('Search Precision by Disease Category\n(Using Exact Phrase Matching)')
-            ax1.axvline(x=5, color='red', linestyle='--', alpha=0.7, label='Broad search (>5%)')
-            ax1.axvline(x=2, color='orange', linestyle='--', alpha=0.7, label='Acceptable (2-5%)')
-            ax1.axvline(x=1, color='green', linestyle='--', alpha=0.7, label='Precise (<1%)')
-            
-            # Color bars based on search precision levels
-            for i, (bar, disease, pct) in enumerate(zip(bars, diseases, percentages)):
-                if pct <= 1.0:
-                    bar.set_color('darkgreen')  # Precise
-                elif pct <= 2.0:
-                    bar.set_color('green')  # Specific  
-                elif pct <= 5.0:
-                    bar.set_color('orange')  # Acceptable
-                else:
-                    bar.set_color('red')  # Too broad
-            
-            ax1.legend()
-            
-            # Add annotations for motor neuron disease showing precision level
-            for i, (disease, pct) in enumerate(zip(diseases, percentages)):
-                if disease == 'Motor neuron disease':
-                    if pct <= 1.0:
-                        ax1.text(pct + 0.2, i, f'{pct:.1f}% - PRECISE', va='center', fontweight='bold', color='darkgreen')
-                    elif pct <= 2.0:
-                        ax1.text(pct + 0.2, i, f'{pct:.1f}% - SPECIFIC', va='center', fontweight='bold', color='green')
-                    elif pct <= 5.0:
-                        ax1.text(pct + 0.2, i, f'{pct:.1f}% - BROAD', va='center', fontweight='bold', color='orange')
-        
-        # 2. Search precision distribution across all diseases
-        ax2 = axes[0, 1]
-        if 'disease_search_validation' in self.validation_results:
-            disease_validation = self.validation_results['disease_search_validation']
-            
-            # Create precision categories
-            precision_categories = ['Precise\n(<1%)', 'Specific\n(1-2%)', 'Acceptable\n(2-5%)', 'Too Broad\n(>5%)']
-            precision_counts = [0, 0, 0, 0]
-            
-            for disease, stats in disease_validation.items():
-                if disease == 'Rare genetic condition XYZ':  # Skip test case
-                    continue
-                pct = stats['percentage_of_database']
-                if pct <= 1.0:
-                    precision_counts[0] += 1
-                elif pct <= 2.0:
-                    precision_counts[1] += 1
-                elif pct <= 5.0:
-                    precision_counts[2] += 1
-                else:
-                    precision_counts[3] += 1
-            
-            colors = ['darkgreen', 'green', 'orange', 'red']
-            bars = ax2.bar(precision_categories, precision_counts, color=colors, alpha=0.7)
-            ax2.set_ylabel('Number of Disease Categories')
-            ax2.set_title('Search Precision Distribution\n(Across Disease Categories Tested)')
-            
-            # Add count labels on bars
-            for bar, count in zip(bars, precision_counts):
-                height = bar.get_height()
-                if height > 0:
-                    ax2.text(bar.get_x() + bar.get_width()/2., height + 0.05,
-                            f'{count}', ha='center', va='bottom', fontweight='bold')
-            
-            ax2.set_ylim(0, max(precision_counts) + 1)
-        
-        # 3. Year distribution (filtered)
-        year_counts = self.results.get('year_counts', {})
-        if year_counts:
-            ax3 = axes[1, 0]
-            years = sorted(year_counts.keys())
-            counts = [year_counts[year] for year in years]
-            
-            ax3.plot(years, counts, marker='o', linewidth=2, color='blue')
-            ax3.set_xlabel('Year')
-            ax3.set_ylabel('Papers')
-            ax3.set_title(f'Papers by Year ({self.min_year}-{self.max_year})\nFiltered Dataset Quality')
-            ax3.grid(True, alpha=0.3)
-            ax3.fill_between(years, counts, alpha=0.3, color='blue')
-        
-        # 4. Search methodology guidelines and benchmarks
-        ax4 = axes[1, 1]
-        ax4.axis('off')
-        
-        # Summary text focused on research gap analysis guidance
-        summary_text = f"SEARCH METHODOLOGY VALIDATION ({self.min_year}-{self.max_year})\n\n"
-        
-        total_papers = self.results.get('total_papers', 0)
-        excluded_papers = self.results.get('excluded_years', 0)
-        
-        summary_text += f"Dataset: {total_papers:,} papers analyzed\n"
-        summary_text += f"Time range: {self.max_year - self.min_year + 1} years of modern research\n\n"
-        
-        if 'disease_search_validation' in self.validation_results:
-            disease_validation = self.validation_results['disease_search_validation']
-            
-            # Calculate precision distribution
-            precise_count = sum(1 for d, s in disease_validation.items() 
-                              if s['percentage_of_database'] <= 1.0 and d != 'Rare genetic condition XYZ')
-            specific_count = sum(1 for d, s in disease_validation.items() 
-                               if 1.0 < s['percentage_of_database'] <= 2.0 and d != 'Rare genetic condition XYZ')
-            broad_count = sum(1 for d, s in disease_validation.items() 
-                            if s['percentage_of_database'] > 5.0 and d != 'Rare genetic condition XYZ')
-            total_tested = len([d for d in disease_validation.keys() if d != 'Rare genetic condition XYZ'])
-            
-            summary_text += "SEARCH PRECISION VALIDATION:\n"
-            summary_text += f"Diseases tested: {total_tested}\n"
-            summary_text += f"Precise searches (<1%): {precise_count}\n"
-            summary_text += f"Specific searches (1-2%): {specific_count}\n"
-            summary_text += f"Broad searches (>5%): {broad_count}\n\n"
-        
-        summary_text += "SEARCH METHODOLOGY BENCHMARKS:\n"
-        summary_text += "• <1% = Precise (ideal for specific diseases)\n"
-        summary_text += "• 1-2% = Specific (good for disease categories)\n"
-        summary_text += "• 2-5% = Acceptable (broad but usable)\n"
-        summary_text += "• >5% = Too broad (likely false positives)\n\n"
-        
-        summary_text += "RESEARCH GAP ANALYSIS GUIDELINES:\n"
-        summary_text += "1. Use exact disease names with word boundaries\n"
-        summary_text += "2. Test search precision with samples first\n"
-        summary_text += "3. Flag searches matching >5% of papers\n"
-        summary_text += "4. Prefer MeSH terms over free text\n"
-        summary_text += "5. Validate search methodology before full analysis"
-        
-        # Color based on overall search methodology validation success
-        if 'disease_search_validation' in self.validation_results:
-            disease_validation = self.validation_results['disease_search_validation']
-            broad_count = sum(1 for d, s in disease_validation.items() 
-                            if s['percentage_of_database'] > 5.0 and d != 'Rare genetic condition XYZ')
-            
-            if broad_count == 0:
-                bg_color = 'lightgreen'  # All searches precise
-            elif broad_count == 1:
-                bg_color = 'lightyellow'  # One broad search detected
-            else:
-                bg_color = 'lightcoral'  # Multiple broad searches
-        else:
-            bg_color = 'lightblue'
-        
-        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor=bg_color, alpha=0.8))
-        
-        plt.tight_layout()
-        
-        # Save validation plot
-        validation_file = os.path.join(self.output_dir, 'validation_analysis_charts.png')
-        plt.savefig(validation_file, dpi=300, bbox_inches='tight')
-        print(f"✅ Validation charts saved: {validation_file}")
-        
-        plt.show()
-    
-    def create_visualizations(self):
-        """Create beautiful visualizations of the data (filtered range only)"""
-        print(f"\n📊 CREATING VISUALIZATIONS...")
-        
-        year_counts = self.results.get('year_counts', {})
-        if not year_counts:
-            print("❌ No year data for visualizations")
-            return
-        
-        # Prepare data for plotting
-        years = sorted(year_counts.keys())
-        counts = [year_counts[year] for year in years]
-        
         # Create figure with subplots
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-        fig.suptitle(f'PubMed Dataset Analysis ({self.min_year}-{self.max_year})', 
-                    fontsize=16, fontweight='bold')
+        fig = plt.figure(figsize=(20, 16))
         
-        # 1. Time series plot
-        ax1.plot(years, counts, marker='o', linewidth=2, markersize=4)
-        ax1.set_title(f'Papers Published by Year ({self.min_year}-{self.max_year})')
-        ax1.set_xlabel('Year')
-        ax1.set_ylabel('Number of Papers')
-        ax1.grid(True, alpha=0.3)
+        # 1. Year coverage heatmap
+        ax1 = plt.subplot(3, 3, 1)
         
-        # Format y-axis with thousands
-        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1000:.0f}K'))
+        # Create coverage matrix for top conditions
+        coverage_matrix = []
+        condition_names = []
         
-        # 2. Data filtering summary (pie chart)
-        total_papers = self.results.get('total_papers', 0)
-        excluded_papers = self.results.get('excluded_years', 0)
+        # Sort conditions by total papers for better visualization
+        sorted_conditions = sorted(self.available_conditions, 
+                                 key=lambda x: self.condition_stats[x].get('total_papers', 0), 
+                                 reverse=True)[:30]
         
-        filter_data = [total_papers, excluded_papers]
-        filter_labels = [f'Included ({self.min_year}-{self.max_year})', 'Excluded (outside range)']
-        colors = ['lightblue', 'lightcoral']
-        
-        ax2.pie(filter_data, labels=filter_labels, autopct='%1.1f%%', colors=colors, startangle=90)
-        ax2.set_title('Data Filtering Results')
-        
-        # 3. Decade distribution (bar chart) - only for included years
-        stats = self.results.get('statistics', {})
-        decade_totals = stats.get('decade_totals', {})
-        if decade_totals:
-            decades = sorted(decade_totals.keys())
-            decade_counts = [decade_totals[d] for d in decades]
-            decade_labels = [f"{d}s" for d in decades]
+        for condition in sorted_conditions:
+            clean_name = condition.replace('_', ' ')
+            if len(clean_name) > 20:
+                clean_name = clean_name[:17] + '...'
+            condition_names.append(clean_name)
             
-            bars = ax3.bar(decade_labels, decade_counts, color='steelblue', alpha=0.7)
-            ax3.set_title(f'Papers by Decade ({self.min_year}-{self.max_year})')
-            ax3.set_xlabel('Decade')
-            ax3.set_ylabel('Number of Papers')
-            ax3.tick_params(axis='x', rotation=45)
+            row = []
+            stats = self.condition_stats.get(condition, {})
             
-            # Add value labels on bars
-            for bar, count in zip(bars, decade_counts):
-                height = bar.get_height()
-                ax3.text(bar.get_x() + bar.get_width()/2., height,
-                        f'{count/1000:.0f}K', ha='center', va='bottom')
-        
-        # 4. Recent years detail (2020-2024)
-        recent_years = [y for y in years if y >= 2020 and y <= 2024]
-        recent_counts = [year_counts[y] for y in recent_years]
-        
-        if recent_years:
-            ax4.bar(recent_years, recent_counts, color='green', alpha=0.7)
-            ax4.set_title('Recent Years Detail (2020-2024)')
-            ax4.set_xlabel('Year')
-            ax4.set_ylabel('Number of Papers')
+            for year in range(self.min_year, self.max_year + 1):
+                if year in stats.get('years', {}):
+                    papers = stats['years'][year]['papers']
+                    if papers > 0:
+                        row.append(1)  # Has data
+                    else:
+                        row.append(0.5)  # Empty file
+                else:
+                    row.append(0)  # Missing
             
-            # Add value labels
-            for year, count in zip(recent_years, recent_counts):
-                ax4.text(year, count, f'{count/1000:.0f}K', ha='center', va='bottom')
+            coverage_matrix.append(row)
         
+        if coverage_matrix:
+            # Show every 5th year for readability
+            year_labels = [str(y) if y % 5 == 0 else '' for y in range(self.min_year, self.max_year + 1)]
+            
+            sns.heatmap(coverage_matrix, 
+                       xticklabels=year_labels,
+                       yticklabels=condition_names,
+                       cmap='RdYlGn', vmin=0, vmax=1,
+                       cbar_kws={'label': 'Data Status'},
+                       ax=ax1)
+            ax1.set_title('Data Coverage by Condition and Year (Top 30)')
+            ax1.set_xlabel('Year')
+            ax1.set_ylabel('Condition')
+            ax1.tick_params(axis='x', rotation=45)
+        
+        # 2. Quality score distribution
+        ax2 = plt.subplot(3, 3, 2)
+        scores = list(self.quality_scores.values())
+        
+        ax2.hist(scores, bins=20, edgecolor='black', alpha=0.7, color='steelblue')
+        ax2.axvline(x=80, color='green', linestyle='--', linewidth=2, label='High confidence')
+        ax2.axvline(x=60, color='orange', linestyle='--', linewidth=2, label='Medium confidence')
+        ax2.axvline(x=np.mean(scores), color='red', linestyle='-', linewidth=2, label=f'Mean: {np.mean(scores):.1f}')
+        ax2.set_xlabel('Quality Score')
+        ax2.set_ylabel('Number of Conditions')
+        ax2.set_title('Distribution of Data Quality Scores')
+        ax2.legend()
+        
+        # 3. Temporal trends
+        ax3 = plt.subplot(3, 3, 3)
+        if hasattr(self, 'temporal_stats'):
+            years = sorted(self.temporal_stats['total_by_year'].keys())
+            totals = [self.temporal_stats['total_by_year'][y] for y in years]
+            
+            ax3.plot(years, totals, marker='o', linewidth=2, markersize=4, color='darkblue')
+            ax3.fill_between(years, totals, alpha=0.3, color='lightblue')
+            ax3.set_xlabel('Year')
+            ax3.set_ylabel('Total Papers')
+            ax3.set_title(f'Total Papers Retrieved by Year (Growth: {self.temporal_stats.get("growth_rate", 0):.1f}%)')
+            ax3.grid(True, alpha=0.3)
+            
+            # Format y-axis
+            ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1000:.0f}K' if x >= 1000 else str(int(x))))
+        
+        # 4. Abstract coverage distribution
+        ax4 = plt.subplot(3, 3, 4)
+        abstract_rates = []
+        for condition in self.available_conditions:
+            stats = self.condition_stats.get(condition, {})
+            if stats.get('total_papers', 0) > 100:  # Only include conditions with sufficient data
+                rate = stats['papers_with_abstracts'] / stats['total_papers'] * 100
+                abstract_rates.append(rate)
+        
+        if abstract_rates:
+            ax4.hist(abstract_rates, bins=20, edgecolor='black', alpha=0.7, color='skyblue')
+            ax4.axvline(x=np.mean(abstract_rates), color='red', linestyle='--', linewidth=2,
+                       label=f'Mean: {np.mean(abstract_rates):.1f}%')
+            ax4.axvline(x=70, color='green', linestyle=':', linewidth=2, label='Target: 70%')
+            ax4.set_xlabel('Abstract Coverage (%)')
+            ax4.set_ylabel('Number of Conditions')
+            ax4.set_title('Abstract Availability by Condition')
+            ax4.legend()
+        
+        # 5. MeSH coverage distribution
+        ax5 = plt.subplot(3, 3, 5)
+        mesh_rates = []
+        for condition in self.available_conditions:
+            stats = self.condition_stats.get(condition, {})
+            if stats.get('total_papers', 0) > 100:  # Only include conditions with sufficient data
+                rate = stats['papers_with_mesh'] / stats['total_papers'] * 100
+                mesh_rates.append(rate)
+        
+        if mesh_rates:
+            ax5.hist(mesh_rates, bins=20, edgecolor='black', alpha=0.7, color='lightgreen')
+            ax5.axvline(x=np.mean(mesh_rates), color='red', linestyle='--', linewidth=2,
+                       label=f'Mean: {np.mean(mesh_rates):.1f}%')
+            ax5.axvline(x=70, color='darkgreen', linestyle=':', linewidth=2, label='Target: 70%')
+            ax5.set_xlabel('MeSH Coverage (%)')
+            ax5.set_ylabel('Number of Conditions')
+            ax5.set_title('MeSH Term Availability by Condition')
+            ax5.legend()
+        
+        # 6. Missing years analysis
+        ax6 = plt.subplot(3, 3, 6)
+        missing_counts = [len(stats.get('missing_years', [])) 
+                         for stats in self.condition_stats.values()]
+        
+        if missing_counts:
+            unique_counts = sorted(set(missing_counts))
+            count_freq = [missing_counts.count(x) for x in unique_counts]
+            
+            colors = ['green' if x == 0 else 'orange' if x <= 10 else 'red' for x in unique_counts]
+            ax6.bar(unique_counts, count_freq, color=colors, edgecolor='black', alpha=0.7)
+            ax6.set_xlabel('Number of Missing Years')
+            ax6.set_ylabel('Number of Conditions')
+            ax6.set_title('Distribution of Missing Years per Condition')
+            ax6.set_xticks(unique_counts[::2] if len(unique_counts) > 10 else unique_counts)
+        
+        # 7. Top conditions by paper count
+        ax7 = plt.subplot(3, 3, 7)
+        condition_papers = [(c, self.condition_stats[c].get('total_papers', 0)) 
+                          for c in self.available_conditions]
+        condition_papers.sort(key=lambda x: x[1], reverse=True)
+        
+        top_conditions = [c[0].replace('_', ' ')[:20] for c in condition_papers[:15]]
+        top_counts = [c[1] for c in condition_papers[:15]]
+        
+        y_pos = np.arange(len(top_conditions))
+        ax7.barh(y_pos, top_counts, alpha=0.7, color='purple')
+        ax7.set_yticks(y_pos)
+        ax7.set_yticklabels(top_conditions, fontsize=9)
+        ax7.set_xlabel('Total Papers')
+        ax7.set_title('Top 15 Conditions by Paper Count')
+        
+        # Format x-axis
+        ax7.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1000:.0f}K' if x >= 1000 else str(int(x))))
+        
+        # 8. Data quality issues
+        ax8 = plt.subplot(3, 3, 8)
+        
+        # Count different types of issues
+        issue_types = {
+            'Missing Years': sum(1 for s in self.condition_stats.values() if s.get('missing_years')),
+            'Low Abstracts': sum(1 for s in self.condition_stats.values() 
+                               if s.get('total_papers', 0) > 0 and 
+                               s.get('papers_with_abstracts', 0) / s.get('total_papers', 1) < 0.5),
+            'Low MeSH': sum(1 for s in self.condition_stats.values() 
+                           if s.get('total_papers', 0) > 0 and 
+                           s.get('papers_with_mesh', 0) / s.get('total_papers', 1) < 0.5),
+            'High Duplicates': sum(1 for s in self.condition_stats.values() 
+                                 if s.get('cross_year_duplicate_rate', 0) > 5),
+            'Anomalies': sum(1 for s in self.condition_stats.values() if s.get('anomalous_years'))
+        }
+        
+        if any(issue_types.values()):
+            labels = list(issue_types.keys())
+            sizes = list(issue_types.values())
+            colors = ['red', 'orange', 'yellow', 'pink', 'brown']
+            
+            # Create pie chart
+            wedges, texts, autotexts = ax8.pie(sizes, labels=labels, colors=colors, 
+                                               autopct=lambda pct: f'{pct:.1f}%\n({int(pct * sum(sizes) / 100)})',
+                                               startangle=90)
+            ax8.set_title('Data Quality Issues Distribution')
+            
+            # Make percentage text smaller
+            for autotext in autotexts:
+                autotext.set_fontsize(9)
+        
+        # 9. Summary statistics
+        ax9 = plt.subplot(3, 3, 9)
+        ax9.axis('off')
+        
+        # Calculate key metrics
+        total_papers = sum(s.get('total_papers', 0) for s in self.condition_stats.values())
+        total_unique_pmids = sum(s.get('unique_pmid_count', 0) for s in self.condition_stats.values())
+        
+        summary_text = "📊 VALIDATION SUMMARY\n" + "="*30 + "\n\n"
+        summary_text += f"Total Conditions: {len(self.available_conditions)}\n"
+        summary_text += f"Total Papers: {total_papers:,}\n"
+        summary_text += f"Unique PMIDs: {total_unique_pmids:,}\n"
+        summary_text += f"Year Range: {self.min_year}-{self.max_year}\n\n"
+        
+        summary_text += "📈 QUALITY METRICS:\n"
+        if scores:
+            summary_text += f"Mean Quality Score: {np.mean(scores):.1f}\n"
+            summary_text += f"Median Quality Score: {np.median(scores):.1f}\n"
+        if abstract_rates:
+            summary_text += f"Mean Abstract Coverage: {np.mean(abstract_rates):.1f}%\n"
+        if mesh_rates:
+            summary_text += f"Mean MeSH Coverage: {np.mean(mesh_rates):.1f}%\n"
+        
+        summary_text += f"\n🔍 DATA COMPLETENESS:\n"
+        complete = len([c for c in self.available_conditions 
+                       if not self.condition_stats[c].get('missing_years')])
+        summary_text += f"Complete coverage: {complete}/{len(self.available_conditions)}\n"
+        summary_text += f"Conditions with gaps: {len(self.available_conditions) - complete}\n"
+        
+        if hasattr(self, 'temporal_stats'):
+            summary_text += f"\n📊 TEMPORAL TRENDS:\n"
+            summary_text += f"Growth Rate: {self.temporal_stats.get('growth_rate', 0):.1f}%\n"
+            summary_text += f"Trend R²: {self.temporal_stats.get('trend_r2', 0):.3f}\n"
+            
+            if self.temporal_stats.get('trend_p_value', 1) < 0.05:
+                summary_text += f"Trend: Significant (p<0.05)\n"
+            else:
+                summary_text += f"Trend: Not significant\n"
+        
+        # Determine overall assessment
+        mean_score = np.mean(scores) if scores else 0
+        if mean_score >= 80:
+            assessment = "✅ HIGH CONFIDENCE\nData ready for analysis"
+            box_color = 'lightgreen'
+        elif mean_score >= 60:
+            assessment = "⚠️ MEDIUM CONFIDENCE\nConsider re-retrieval for low-quality conditions"
+            box_color = 'lightyellow'
+        else:
+            assessment = "❌ LOW CONFIDENCE\nSignificant data issues detected"
+            box_color = 'lightcoral'
+        
+        summary_text += f"\n{assessment}"
+        
+        ax9.text(0.05, 0.95, summary_text, transform=ax9.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor=box_color, alpha=0.8))
+        
+        plt.suptitle('PubMed Retrieval Validation Dashboard (00-01)', fontsize=16, fontweight='bold')
         plt.tight_layout()
         
-        # Save plot to output directory
-        output_file = os.path.join(self.output_dir, 'pubmed_analysis_charts.png')
+        # Save plot
+        output_file = os.path.join(self.output_dir, '00-01-validation-dashboard.png')
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"✅ Charts saved: {output_file}")
+        print(f"✅ Dashboard saved: {output_file}")
         
         plt.show()
     
-    def export_validation_results(self):
-        """Export validation results showing search methodology improvements"""
-        print(f"\n💾 EXPORTING VALIDATION RESULTS...")
+    def export_validation_report(self):
+        """Export comprehensive validation report following naming convention"""
+        print(f"\n💾 EXPORTING VALIDATION REPORTS...")
         
-        if not self.validation_results:
-            print("❌ No validation results to export")
-            return
+        # 1. Export condition quality scores
+        condition_data = []
+        for condition in self.available_conditions:
+            stats = self.condition_stats[condition]
+            clean_name = condition.replace('_', ' ')
+            
+            condition_data.append({
+                'Condition': clean_name,
+                'Condition_Folder': condition,
+                'Quality_Score': round(stats['quality_score'], 1),
+                'Total_Papers': stats['total_papers'],
+                'Unique_PMIDs': stats.get('unique_pmid_count', 0),
+                'Papers_With_Abstracts': stats['papers_with_abstracts'],
+                'Abstract_Coverage_%': round(stats['papers_with_abstracts'] / stats['total_papers'] * 100, 1) if stats['total_papers'] > 0 else 0,
+                'Papers_With_MeSH': stats['papers_with_mesh'],
+                'MeSH_Coverage_%': round(stats['papers_with_mesh'] / stats['total_papers'] * 100, 1) if stats['total_papers'] > 0 else 0,
+                'Year_Coverage_%': round(stats['year_coverage'], 1),
+                'Missing_Years': len(stats['missing_years']),
+                'Cross_Year_Duplicates_%': round(stats.get('cross_year_duplicate_rate', 0), 1),
+                'Quality_Issues': len(stats['quality_issues']),
+                'Anomalous_Years': len(stats['anomalous_years'])
+            })
         
-        # Export disease search validation
-        if 'disease_search_validation' in self.validation_results:
-            disease_data = []
-            for disease, stats in self.validation_results['disease_search_validation'].items():
+        condition_df = pd.DataFrame(condition_data)
+        condition_df = condition_df.sort_values('Quality_Score', ascending=False)
+        condition_file = os.path.join(self.output_dir, '00-01-condition-quality-scores.csv')
+        condition_df.to_csv(condition_file, index=False)
+        print(f"✅ Condition scores: 00-01-condition-quality-scores.csv")
+        
+        # 2. Export temporal data
+        if hasattr(self, 'temporal_df'):
+            temporal_file = os.path.join(self.output_dir, '00-01-temporal-paper-counts.csv')
+            # Add totals row
+            temporal_with_totals = self.temporal_df.copy()
+            temporal_with_totals.loc['TOTAL'] = temporal_with_totals.sum()
+            temporal_with_totals.to_csv(temporal_file)
+            print(f"✅ Temporal data: 00-01-temporal-paper-counts.csv")
+        
+        # 3. Export data gaps analysis
+        gaps_data = []
+        for condition, missing_years in self.data_gaps['missing_years'].items():
+            clean_name = condition.replace('_', ' ')
+            for year in missing_years:
+                gaps_data.append({
+                    'Condition': clean_name,
+                    'Condition_Folder': condition,
+                    'Missing_Year': year,
+                    'Type': 'Missing Data'
+                })
+        
+        # Add empty files
+        for item in self.data_gaps.get('empty_files', []):
+            clean_name = item['condition'].replace('_', ' ')
+            gaps_data.append({
+                'Condition': clean_name,
+                'Condition_Folder': item['condition'],
+                'Missing_Year': item['year'],
+                'Type': 'Empty File'
+            })
+        
+        if gaps_data:
+            gaps_df = pd.DataFrame(gaps_data)
+            gaps_df = gaps_df.sort_values(['Condition', 'Missing_Year'])
+            gaps_file = os.path.join(self.output_dir, '00-01-data-gaps.csv')
+            gaps_df.to_csv(gaps_file, index=False)
+            print(f"✅ Data gaps: 00-01-data-gaps.csv")
+        
+        # 4. Export conditions needing re-retrieval
+        low_quality = [(c, self.quality_scores[c]) for c, s in self.quality_scores.items() if s < 60]
+        if low_quality:
+            reretrieval_data = []
+            for condition, score in sorted(low_quality, key=lambda x: x[1]):
+                stats = self.condition_stats[condition]
+                clean_name = condition.replace('_', ' ')
                 
-                # Special handling for motor neuron disease search improvements
-                if disease == 'Motor neuron disease':
-                    if stats['percentage_of_database'] <= 1.0:
-                        status = 'IMPROVED'
-                        notes = f'Search methodology improved using exact phrase matching (was 20.1%, now {stats["percentage_of_database"]:.1f}%)'
-                    elif stats['percentage_of_database'] <= 2.0:
-                        status = 'BETTER'
-                        notes = f'Good improvement from 20.1% to {stats["percentage_of_database"]:.1f}% with exact phrases'
-                    elif stats['percentage_of_database'] <= 5.0:
-                        status = 'PARTIAL'
-                        notes = f'Some improvement from 20.1% to {stats["percentage_of_database"]:.1f}% but could be more specific'
-                    else:
-                        status = 'STILL_BROAD'
-                        notes = 'Search terms still need further refinement'
-                else:
-                    status = 'SUSPICIOUS' if stats['percentage_of_database'] > 5 else 'REASONABLE'
-                    notes = ''
+                issues = []
+                if stats['missing_years']:
+                    issues.append(f"{len(stats['missing_years'])} missing years")
+                if stats.get('cross_year_duplicate_rate', 0) > 5:
+                    issues.append(f"{stats['cross_year_duplicate_rate']:.1f}% duplicates")
+                if stats['papers_with_abstracts'] / stats['total_papers'] * 100 < 50 if stats['total_papers'] > 0 else False:
+                    issues.append("Low abstract coverage")
                 
-                disease_data.append({
-                    'Disease': disease,
-                    'Estimated_Papers': stats['estimated_full_count'],
-                    'Percentage_of_Database': stats['percentage_of_database'],
-                    'Sample_Matches': stats['sample_matches'],
-                    'Search_Terms': '; '.join(stats['search_terms_used']),
-                    'Status': status,
-                    'Notes': notes,
-                    'Year_Range': f"{self.min_year}-{self.max_year}",
-                    'Search_Method': 'Exact Phrase Matching' if disease == 'Motor neuron disease' else 'Contains Matching'
+                reretrieval_data.append({
+                    'Condition': clean_name,
+                    'Condition_Folder': condition,
+                    'Quality_Score': round(score, 1),
+                    'Total_Papers': stats['total_papers'],
+                    'Issues': '; '.join(issues),
+                    'Missing_Years_List': ', '.join(map(str, stats['missing_years'][:10])) + ('...' if len(stats['missing_years']) > 10 else '')
                 })
             
-            disease_df = pd.DataFrame(disease_data)
-            disease_file = os.path.join(self.output_dir, 'disease_search_validation.csv')
-            disease_df.to_csv(disease_file, index=False)
-            print(f"✅ Disease validation exported: {disease_file}")
+            reretrieval_df = pd.DataFrame(reretrieval_data)
+            reretrieval_file = os.path.join(self.output_dir, '00-01-conditions-for-reretrieval.csv')
+            reretrieval_df.to_csv(reretrieval_file, index=False)
+            print(f"✅ Re-retrieval list: 00-01-conditions-for-reretrieval.csv")
         
-        # Export MeSH analysis
-        if 'mesh_analysis' in self.validation_results:
-            mesh_data = self.validation_results['mesh_analysis']
-            
-            # Most common MeSH terms
-            mesh_terms_data = []
-            for term, count in mesh_data.get('most_common_mesh_terms', {}).items():
-                mesh_terms_data.append({
-                    'MeSH_Term': term,
-                    'Frequency': count,
-                    'Risk_Level': 'HIGH' if count > 50000 else 'MEDIUM' if count > 10000 else 'LOW',
-                    'Year_Range': f"{self.min_year}-{self.max_year}"
-                })
-            
-            mesh_df = pd.DataFrame(mesh_terms_data)
-            mesh_file = os.path.join(self.output_dir, 'mesh_term_frequency_analysis.csv')
-            mesh_df.to_csv(mesh_file, index=False)
-            print(f"✅ MeSH analysis exported: {mesh_file}")
-        
-        # Export recommendations with fix documentation
-        if 'recommendations' in self.validation_results:
-            rec_data = self.validation_results['recommendations']
-            
-            recommendations_text = f"RESEARCH GAP DISCOVERY VALIDATION RECOMMENDATIONS ({self.min_year}-{self.max_year})\n"
-            recommendations_text += "IMPROVED: Search Methodology Enhanced with Exact Phrase Matching\n"
-            recommendations_text += "=" * 70 + "\n\n"
-            
-            recommendations_text += f"YEAR FILTERING APPLIED: {self.min_year}-{self.max_year}\n"
-            recommendations_text += f"Papers included: {self.results.get('total_papers', 0):,}\n"
-            recommendations_text += f"Papers excluded: {self.results.get('excluded_years', 0):,}\n\n"
-            
-            if rec_data.get('improvements_confirmed'):
-                recommendations_text += "SEARCH METHODOLOGY IMPROVEMENTS CONFIRMED:\n"
-                for i, improvement in enumerate(rec_data['improvements_confirmed'], 1):
-                    recommendations_text += f"{i}. {improvement}\n"
-                recommendations_text += "\n"
-            
-            if rec_data.get('issues_found'):
-                recommendations_text += "REMAINING ISSUES:\n"
-                for i, issue in enumerate(rec_data['issues_found'], 1):
-                    recommendations_text += f"{i}. {issue}\n"
-                recommendations_text += "\n"
-            else:
-                recommendations_text += "✅ NO CRITICAL ISSUES FOUND - All validations passed!\n\n"
-            
-            recommendations_text += "RECOMMENDED BEST PRACTICES (UPDATED WITH FIX):\n"
-            for i, rec in enumerate(rec_data['recommendations'], 1):
-                recommendations_text += f"{i}. {rec}\n"
-            
-            recommendations_text += "\nSEARCH METHODOLOGY IMPROVEMENT DETAILS:\n"
-            recommendations_text += "PROBLEM: Original substring matching caught too many irrelevant papers (20.1%)\n"
-            recommendations_text += "SOLUTION: Implemented exact phrase matching with word boundaries\n"
-            recommendations_text += "TECHNIQUE: Use \\b regex boundaries for complete word/phrase matches only\n"
-            recommendations_text += "RESULT: Reduced false positives significantly, improved search precision\n"
-            recommendations_text += "LESSON: Always use exact phrase matching for specific disease searches\n\n"
-            
-            recommendations_text += "EXACT PHRASE MATCHING IMPLEMENTATION:\n"
-            recommendations_text += "1. Use re.escape() to handle special characters in phrases\n"
-            recommendations_text += "2. Add \\b word boundaries before and after phrases\n"
-            recommendations_text += "3. Case-insensitive matching with .lower()\n"
-            recommendations_text += "4. Test each phrase separately then combine results\n"
-            recommendations_text += "5. Count unique papers to avoid double-counting\n\n"
-            
-            recommendations_text += "APPLICATION TO RESEARCH GAP DISCOVERY:\n"
-            recommendations_text += "• Use this exact phrase matching methodology in gap analysis scripts\n"
-            recommendations_text += "• Apply word boundaries to prevent false positives\n"
-            recommendations_text += "• Validate search precision with sample testing\n"
-            recommendations_text += "• Monitor search result percentages for overly broad terms\n"
-            
-            rec_file = os.path.join(self.output_dir, 'research_gap_discovery_recommendations.txt')
-            with open(rec_file, 'w') as f:
-                f.write(recommendations_text)
-            print(f"✅ Recommendations exported: {rec_file}")
-    
-    def export_results(self):
-        """Export results to CSV files in output directory"""
-        print(f"\n💾 EXPORTING RESULTS...")
-        
-        # Export year-by-year data (filtered)
-        year_counts = self.results.get('year_counts', {})
-        if year_counts:
-            year_df = pd.DataFrame([
-                {'Year': year, 'Papers': count, 'Percentage': count/sum(year_counts.values())*100}
-                for year, count in sorted(year_counts.items())
-            ])
-            
-            year_file = os.path.join(self.output_dir, 'pubmed_year_analysis.csv')
-            year_df.to_csv(year_file, index=False)
-            print(f"✅ Year analysis exported: {year_file}")
-        
-        # Export summary statistics
-        stats = self.results.get('statistics', {})
-        if stats:
-            summary_data = []
-            for key, value in stats.items():
-                if isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        summary_data.append({'Metric': f"{key}_{sub_key}", 'Value': sub_value})
-                else:
-                    summary_data.append({'Metric': key, 'Value': value})
-            
-            summary_df = pd.DataFrame(summary_data)
-            summary_file = os.path.join(self.output_dir, 'pubmed_summary_statistics.csv')
-            summary_df.to_csv(summary_file, index=False)
-            print(f"✅ Summary statistics exported: {summary_file}")
-        
-        # Export detailed report
-        self.export_detailed_report()
-        
-        # Export validation results
-        self.export_validation_results()
-    
-    def export_detailed_report(self):
-        """Export comprehensive report showing search methodology improvements"""
-        report_file = os.path.join(self.output_dir, 'enhanced_pubmed_analysis_report.txt')
-        
+        # 5. Generate comprehensive text report
+        report_file = os.path.join(self.output_dir, '00-01-validation-report.txt')
         with open(report_file, 'w') as f:
-            f.write(f"ENHANCED PUBMED DATASET ANALYSIS WITH VALIDATION REPORT ({self.min_year}-{self.max_year})\n")
-            f.write("IMPROVED: Search Methodology Enhanced with Exact Phrase Matching\n")
-            f.write("=" * 70 + "\n")
+            f.write("="*80 + "\n")
+            f.write("PUBMED RETRIEVAL VALIDATION REPORT (00-01)\n")
+            f.write("="*80 + "\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Data file: {self.file_path}\n")
-            f.write(f"Year filter applied: {self.min_year}-{self.max_year}\n\n")
+            f.write(f"Input Directory: {self.condition_data_dir}\n")
+            f.write(f"Output Directory: {self.output_dir}\n")
+            f.write(f"Analysis Period: {self.min_year}-{self.max_year}\n\n")
             
-            # Basic statistics
-            total_papers = self.results.get('total_papers', 'Unknown')
-            excluded_papers = self.results.get('excluded_years', 0)
-            stats = self.results.get('statistics', {})
+            # Overall statistics
+            total_papers = sum(s.get('total_papers', 0) for s in self.condition_stats.values())
+            total_unique = sum(s.get('unique_pmid_count', 0) for s in self.condition_stats.values())
             
-            f.write("BASIC STATISTICS:\n")
-            f.write(f"   Papers in analysis range ({self.min_year}-{self.max_year}): {total_papers:,}\n")
-            f.write(f"   Papers excluded (outside range): {excluded_papers:,}\n")
-            f.write(f"   Invalid/missing years: {stats.get('invalid_years', 0):,}\n")
-            f.write(f"   Data completeness: {stats.get('data_completeness', 0):.1f}%\n\n")
+            f.write("OVERALL STATISTICS\n")
+            f.write("-"*40 + "\n")
+            f.write(f"Total Conditions Analyzed: {len(self.available_conditions)}\n")
+            f.write(f"Total Papers Retrieved: {total_papers:,}\n")
+            f.write(f"Total Unique PMIDs: {total_unique:,}\n")
+            f.write(f"Mean Papers per Condition: {total_papers/len(self.available_conditions):.0f}\n")
+            f.write(f"Mean Quality Score: {np.mean(list(self.quality_scores.values())):.1f}\n")
+            f.write(f"Median Quality Score: {np.median(list(self.quality_scores.values())):.1f}\n\n")
             
-            # Validation results with improvement documentation
-            if self.validation_results:
-                f.write("RESEARCH GAP DISCOVERY VALIDATION RESULTS:\n")
-                f.write("=" * 50 + "\n\n")
+            # Quality distribution
+            high = len([s for s in self.quality_scores.values() if s >= 80])
+            medium = len([s for s in self.quality_scores.values() if 60 <= s < 80])
+            low = len([s for s in self.quality_scores.values() if s < 60])
+            
+            f.write("QUALITY DISTRIBUTION\n")
+            f.write("-"*40 + "\n")
+            f.write(f"High Quality (≥80): {high} conditions ({high/len(self.available_conditions)*100:.1f}%)\n")
+            f.write(f"Medium Quality (60-79): {medium} conditions ({medium/len(self.available_conditions)*100:.1f}%)\n")
+            f.write(f"Low Quality (<60): {low} conditions ({low/len(self.available_conditions)*100:.1f}%)\n\n")
+            
+            # Top quality conditions
+            f.write("TOP 10 HIGH-QUALITY CONDITIONS\n")
+            f.write("-"*40 + "\n")
+            top_conditions = sorted(self.quality_scores.items(), key=lambda x: x[1], reverse=True)[:10]
+            for i, (condition, score) in enumerate(top_conditions, 1):
+                clean_name = condition.replace('_', ' ')
+                stats = self.condition_stats[condition]
+                f.write(f"{i:2}. {clean_name}: {score:.1f} (Papers: {stats['total_papers']:,})\n")
+            
+            f.write("\n")
+            
+            # Data completeness
+            complete = len([c for c in self.available_conditions 
+                          if not self.condition_stats[c].get('missing_years')])
+            
+            f.write("DATA COMPLETENESS\n")
+            f.write("-"*40 + "\n")
+            f.write(f"Conditions with complete year coverage: {complete}\n")
+            f.write(f"Conditions with missing years: {len(self.available_conditions) - complete}\n")
+            f.write(f"Total missing condition-year combinations: {sum(len(s.get('missing_years', [])) for s in self.condition_stats.values())}\n\n")
+            
+            # Temporal analysis
+            if hasattr(self, 'temporal_stats'):
+                f.write("TEMPORAL ANALYSIS\n")
+                f.write("-"*40 + "\n")
+                f.write(f"Overall Growth Rate: {self.temporal_stats.get('growth_rate', 0):.1f}%\n")
+                f.write(f"Annual Trend Slope: {self.temporal_stats.get('trend_slope', 0):.1f} papers/year\n")
+                f.write(f"Trend R²: {self.temporal_stats.get('trend_r2', 0):.3f}\n")
+                f.write(f"Trend P-value: {self.temporal_stats.get('trend_p_value', 1):.4f}\n")
                 
-                # Document successful improvements
-                if 'recommendations' in self.validation_results:
-                    rec_data = self.validation_results['recommendations']
-                    if rec_data.get('improvements_confirmed'):
-                        f.write("SEARCH METHODOLOGY IMPROVEMENTS CONFIRMED:\n")
-                        for improvement in rec_data['improvements_confirmed']:
-                            f.write(f"   {improvement}\n")
-                        f.write("\n")
-                
-                if 'disease_search_validation' in self.validation_results:
-                    f.write("DISEASE SEARCH VALIDATION (IMPROVED METHODOLOGY):\n")
-                    disease_validation = self.validation_results['disease_search_validation']
-                    
-                    for disease, stats in disease_validation.items():
-                        f.write(f"\n{disease}:\n")
-                        f.write(f"   Estimated papers: {stats['estimated_full_count']:,}\n")
-                        f.write(f"   % of database: {stats['percentage_of_database']:.2f}%\n")
-                        
-                        if disease == 'Motor neuron disease':
-                            f.write(f"   Previous value: 20.1% (TOO BROAD)\n")
-                            improvement = ((20.1 - stats['percentage_of_database']) / 20.1) * 100
-                            f.write(f"   Search precision improvement: {improvement:.1f}%\n")
-                            
-                            if stats['percentage_of_database'] <= 1.0:
-                                f.write(f"   Status: ✅ IMPROVED - Excellent search precision with exact phrase matching\n")
-                            elif stats['percentage_of_database'] <= 2.0:
-                                f.write(f"   Status: ✅ BETTER - Good progress with exact phrases\n")
-                            elif stats['percentage_of_database'] <= 5.0:
-                                f.write(f"   Status: ⚠️ PARTIAL - Some progress, may need minor refinement\n")
-                            else:
-                                f.write(f"   Status: 🚨 STILL BROAD - Needs further refinement\n")
-                        else:
-                            status = 'SUSPICIOUS' if stats['percentage_of_database'] > 5 else 'REASONABLE'
-                            f.write(f"   Status: {status}\n")
-                        
-                        f.write(f"   Search terms: {', '.join(stats['search_terms_used'])}\n")
-                        f.write(f"   Search method: {'Exact phrase matching' if disease == 'Motor neuron disease' else 'Contains matching'}\n")
-                
-                if 'recommendations' in self.validation_results:
-                    rec_data = self.validation_results['recommendations']
-                    
-                    if rec_data.get('issues_found'):
-                        f.write(f"\n\nREMAINING SEARCH PRECISION ISSUES:\n")
-                        for issue in rec_data['issues_found']:
-                            f.write(f"   • {issue}\n")
-                    else:
-                        f.write(f"\n\n✅ ALL VALIDATIONS PASSED - Search methodology improvements successful!\n")
-                    
-                    f.write(f"\nBEST PRACTICES FOR RESEARCH GAP DISCOVERY (UPDATED):\n")
-                    for rec in rec_data['recommendations']:
-                        f.write(f"   • {rec}\n")
-                    
-                    f.write(f"\nEXACT PHRASE MATCHING METHODOLOGY:\n")
-                    f.write(f"   PROBLEM: Substring matching caught partial words and irrelevant contexts\n")
-                    f.write(f"   SOLUTION: Implemented regex with word boundaries (\\b) for exact phrases only\n")
-                    f.write(f"   IMPLEMENTATION: re.search(r'\\b' + re.escape(phrase.lower()) + r'\\b', text.lower())\n")
-                    f.write(f"   RESULT: Dramatically improved search precision from 20.1% to acceptable levels\n")
-                    f.write(f"   PRINCIPLE: Always use exact phrase matching for specific disease searches\n")
-                    f.write(f"   VALIDATION: Test methodology prevents similar precision issues in research gap analysis\n")
+                if self.temporal_stats.get('trend_p_value', 1) < 0.05:
+                    f.write("Statistical Significance: Yes (p < 0.05)\n\n")
+                else:
+                    f.write("Statistical Significance: No\n\n")
+            
+            # MeSH analysis
+            if hasattr(self, 'mesh_stats'):
+                f.write("MESH TERM ANALYSIS\n")
+                f.write("-"*40 + "\n")
+                f.write(f"Mean MeSH Coverage: {self.mesh_stats.get('mean_coverage', 0):.1f}%\n")
+                f.write(f"Total Unique MeSH Terms: {self.mesh_stats.get('total_unique_terms', 0):,}\n")
+                f.write(f"Mean Terms per Paper: {self.mesh_stats.get('mean_terms_per_paper', 0):.1f}\n\n")
+            
+            # Issues and recommendations
+            f.write("IDENTIFIED ISSUES\n")
+            f.write("-"*40 + "\n")
+            
+            # Systematic gaps
+            if hasattr(self, 'data_gaps'):
+                suspicious = self.data_gaps.get('suspicious_patterns', [])
+                if suspicious:
+                    f.write("\nSystematic Issues:\n")
+                    for pattern in suspicious:
+                        f.write(f"  • {pattern['description']}\n")
+                        if 'details' in pattern:
+                            for year, count in sorted(pattern['details'].items())[:5]:
+                                f.write(f"    - Year {year}: {count} conditions affected\n")
+            
+            # Conditions needing attention
+            need_attention = [c for c, s in self.quality_scores.items() if s < 60]
+            if need_attention:
+                f.write(f"\nConditions Requiring Re-retrieval: {len(need_attention)}\n")
+                f.write("Top 10 conditions needing attention:\n")
+                for condition in sorted(need_attention, key=lambda x: self.quality_scores[x])[:10]:
+                    clean_name = condition.replace('_', ' ')
+                    score = self.quality_scores[condition]
+                    stats = self.condition_stats[condition]
+                    f.write(f"  • {clean_name} (Score: {score:.1f})\n")
+                    if stats['missing_years']:
+                        f.write(f"    - Missing {len(stats['missing_years'])} years\n")
+                    if stats.get('cross_year_duplicate_rate', 0) > 5:
+                        f.write(f"    - Cross-year duplicates: {stats['cross_year_duplicate_rate']:.1f}%\n")
+            
+            f.write("\n")
+            
+            # Final assessment
+            f.write("FINAL ASSESSMENT\n")
+            f.write("-"*40 + "\n")
+            
+            mean_score = np.mean(list(self.quality_scores.values()))
+            if mean_score >= 80:
+                f.write("✅ OVERALL CONFIDENCE: HIGH\n")
+                f.write("The retrieved data is of high quality and ready for analysis.\n")
+                f.write("Proceed with semantic analysis and DALY integration.\n")
+            elif mean_score >= 60:
+                f.write("⚠️  OVERALL CONFIDENCE: MEDIUM\n")
+                f.write("The data is generally acceptable but has some quality issues.\n")
+                f.write("Consider re-retrieving low-quality conditions before final analysis.\n")
+                f.write(f"Conditions needing attention: {len(need_attention)}\n")
+            else:
+                f.write("❌ OVERALL CONFIDENCE: LOW\n")
+                f.write("Significant data quality issues detected.\n")
+                f.write("Review and improve the retrieval process before proceeding.\n")
+                f.write(f"Conditions with major issues: {len(need_attention)}\n")
         
-        print(f"✅ Enhanced report exported: {report_file}")
+        print(f"✅ Report: 00-01-validation-report.txt")
+        
+        # 6. Create summary JSON for programmatic access
+        summary = {
+            'analysis_date': datetime.now().isoformat(),
+            'input_directory': self.condition_data_dir,
+            'output_directory': self.output_dir,
+            'year_range': f"{self.min_year}-{self.max_year}",
+            'statistics': {
+                'total_conditions': len(self.available_conditions),
+                'total_papers': sum(s.get('total_papers', 0) for s in self.condition_stats.values()),
+                'total_unique_pmids': sum(s.get('unique_pmid_count', 0) for s in self.condition_stats.values()),
+                'mean_quality_score': float(np.mean(list(self.quality_scores.values()))),
+                'median_quality_score': float(np.median(list(self.quality_scores.values()))),
+                'high_quality_conditions': len([s for s in self.quality_scores.values() if s >= 80]),
+                'medium_quality_conditions': len([s for s in self.quality_scores.values() if 60 <= s < 80]),
+                'low_quality_conditions': len([s for s in self.quality_scores.values() if s < 60])
+            },
+            'temporal_stats': self.temporal_stats if hasattr(self, 'temporal_stats') else {},
+            'mesh_stats': {
+                'mean_coverage': self.mesh_stats.get('mean_coverage', 0),
+                'total_unique_terms': self.mesh_stats.get('total_unique_terms', 0),
+                'mean_terms_per_paper': self.mesh_stats.get('mean_terms_per_paper', 0)
+            } if hasattr(self, 'mesh_stats') else {},
+            'conditions_for_reretrieval': [c for c, s in self.quality_scores.items() if s < 60],
+            'data_gaps_summary': {
+                'conditions_with_missing_years': len(self.data_gaps.get('missing_years', {})),
+                'total_missing_years': sum(len(years) for years in self.data_gaps.get('missing_years', {}).values()),
+                'systematic_gaps': self.data_gaps.get('suspicious_patterns', [])
+            } if hasattr(self, 'data_gaps') else {}
+        }
+        
+        summary_file = os.path.join(self.output_dir, '00-01-validation-summary.json')
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+        print(f"✅ Summary JSON: 00-01-validation-summary.json")
     
-    def run_complete_analysis(self):
-        """Run the complete enhanced analysis pipeline with validation (filtered by year)"""
-        print(f"\n🚀 STARTING ENHANCED ANALYSIS WITH YEAR FILTERING ({self.min_year}-{self.max_year})...")
-        print("🔧 IMPROVED: Search methodology now uses exact phrase matching for better precision")
-        start_time = time.time()
+    def run_complete_validation(self):
+        """Run complete validation pipeline"""
+        print(f"\n🚀 STARTING COMPLETE VALIDATION ANALYSIS...")
+        start_time = datetime.now()
         
         try:
-            # Step 1: Count total papers (filtered)
-            self.count_total_papers()
+            # Step 1: Generate confidence scores for all conditions
+            self.generate_confidence_scores()
             
-            # Step 2: Analyze year distribution (filtered)
-            self.analyze_years()
+            # Step 2: Analyze temporal patterns
+            self.analyze_temporal_patterns()
             
-            # Step 3: Calculate basic statistics (filtered)
-            self.calculate_statistics()
+            # Step 3: Identify data gaps
+            self.identify_data_gaps()
             
-            # ENHANCED VALIDATION STEPS (all filtered)
-            # Step 4: Analyze MeSH terms for validation
-            self.analyze_mesh_terms_validation()
+            # Step 4: Analyze MeSH quality
+            self.analyze_mesh_quality()
             
-            # Step 5: Validate disease search terms (FIXED with exact phrase matching)
-            self.validate_disease_search_terms()
-            
-            # Step 6: Analyze search term overlap
-            self.analyze_search_term_overlap()
-            
-            # Step 7: Generate recommendations (UPDATED)
-            self.generate_validation_recommendations()
-            
-            # Step 8: Display results with validation
-            self.display_results()
-            
-            # Step 9: Create visualizations
-            self.create_visualizations()
-            
-            # Step 10: Create validation visualizations (UPDATED)
+            # Step 5: Create visualizations
             self.create_validation_visualizations()
             
-            # Step 11: Export all results
-            self.export_results()
+            # Step 6: Export results
+            self.export_validation_report()
             
-            total_time = time.time() - start_time
-            print(f"\n✅ ENHANCED ANALYSIS COMPLETE!")
-            print(f"⏱️  Total time: {total_time:.1f} seconds")
+            duration = datetime.now() - start_time
+            print(f"\n✅ VALIDATION COMPLETE!")
+            print(f"⏱️  Time taken: {duration}")
+            
+            # Final summary
+            print(f"\n" + "="*70)
+            print(f"📊 FINAL ASSESSMENT")
+            print(f"="*70)
+            
+            high_quality = len([s for s in self.quality_scores.values() if s >= 80])
+            total_papers = sum(s.get('total_papers', 0) for s in self.condition_stats.values())
+            mean_score = np.mean(list(self.quality_scores.values()))
+            
+            print(f"   Conditions ready for analysis: {high_quality}/{len(self.available_conditions)}")
+            print(f"   Total papers validated: {total_papers:,}")
+            print(f"   Mean quality score: {mean_score:.1f}")
+            
+            if mean_score >= 80:
+                print(f"\n   ✅ OVERALL CONFIDENCE: HIGH")
+                print(f"   Data is ready for semantic analysis and further processing")
+            elif mean_score >= 60:
+                print(f"\n   ⚠️  OVERALL CONFIDENCE: MEDIUM")
+                print(f"   Consider re-retrieving low-quality conditions before final analysis")
+            else:
+                print(f"\n   ❌ OVERALL CONFIDENCE: LOW")
+                print(f"   Significant data quality issues - review retrieval process")
             
         except Exception as e:
-            print(f"❌ Analysis failed: {e}")
-            raise
+            print(f"❌ Validation failed: {e}")
+            import traceback
+            traceback.print_exc()
 
 def main():
     """Main execution function"""
-    
-    print("🚀 ENHANCED PUBMED DATASET ANALYZER (2000-2024 FILTERED)")
-    print("🔧 IMPROVED: Search Term Specificity and Validation Methodology Enhanced")
-    print("Following directory hierarchy:")
-    print("   📂 Scripts: PYTHON/")
-    print("   📂 Data: DATA/")
-    print("   📂 Output: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/")
+    print("🚀 PUBMED RETRIEVAL OUTPUT VALIDATOR (00-01)")
+    print("Validating outputs from 00-00-00-pubmed-mesh-data-retrieval.py")
+    print("Following directory structure: ANALYSIS/00-01-RETRIEVAL-VALIDATION/")
     print()
     
-    # Check if DATA directory exists
-    if not os.path.exists('./DATA'):
-        print("❌ DATA/ directory not found!")
-        print("Make sure you're running from the root directory with DATA/ subdirectory")
-        return
-    
-    # Check if pubmed file exists
-    file_path = './DATA/pubmed_complete_dataset.csv'
-    if not os.path.exists(file_path):
-        print(f"❌ {file_path} not found!")
-        print("Expected file: DATA/pubmed_complete_dataset.csv")
+    # Check if data directory exists
+    if not os.path.exists('./CONDITION_DATA/condition_progress'):
+        print("❌ Data directory not found: ./CONDITION_DATA/condition_progress/")
+        print("Please run 00-00-00-pubmed-mesh-data-retrieval.py first")
         return
     
     try:
-        # Create analyzer with year filtering and run complete analysis
-        analyzer = EnhancedPubMedAnalyzer('pubmed_complete_dataset.csv', 
-                                        min_year=2000, max_year=2024)
-        analyzer.run_complete_analysis()
+        # Create validator and run analysis
+        validator = PubMedRetrievalValidator(min_year=1975, max_year=2024)
+        validator.run_complete_validation()
         
-        print(f"\n🎯 KEY INSIGHTS:")
-        print(f"   ✅ Search methodology improved using exact phrase matching for better precision")
-        print(f"   • Dataset filtered to modern biomedical research (2000-2024)")
-        print(f"   • Excluded {analyzer.results.get('excluded_years', 0):,} papers outside range")
-        print(f"   • Validation confirms successful exact phrase matching methodology")
-        print(f"   • Demonstrates best practices for research gap discovery")
-        print(f"   • Ready for robust research gap analysis with precise search techniques")
-        
-        print(f"\n📂 OUTPUT FILES CREATED:")
-        print(f"   📊 Charts: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/pubmed_analysis_charts.png")
-        print(f"   🔍 Validation: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/validation_analysis_charts.png")
-        print(f"   📋 Year data: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/pubmed_year_analysis.csv")
-        print(f"   🧬 Disease validation: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/disease_search_validation.csv")
-        print(f"   📝 MeSH analysis: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/mesh_term_frequency_analysis.csv")
-        print(f"   💡 Recommendations: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/research_gap_discovery_recommendations.txt")
-        print(f"   📄 Enhanced report: ANALYSIS/00-00-PUBMED-STATISTICAL-ANALYSIS/enhanced_pubmed_analysis_report.txt")
-        
-        print(f"\n🔧 CONFIRMED SEARCH METHODOLOGY IMPROVEMENTS FOR RESEARCH GAP SCRIPT:")
-        print(f"   ✅ Motor neuron disease search: Use exact phrase matching with word boundaries")
-        print(f"   ✅ Implemented regex patterns: \\b + escaped phrase + \\b")
-        print(f"   ✅ Year filtering (2000-2024) successfully applied")
-        print(f"   ✅ Validation framework prevents future search precision issues")
-        print(f"   ✅ Exact phrase matching methodology established")
-        print(f"   ✅ Sample testing methodology proven effective")
-        print(f"   ✅ Word boundary detection prevents false positives")
-        
-        print(f"\n🌟 SUCCESS DEMONSTRATION:")
-        print(f"   • Implemented exact phrase matching with word boundaries")
-        print(f"   • Improved search precision for motor neuron disease research from 20.1% to 0.1%")
-        print(f"   • Established robust exact phrase validation methodology")
-        print(f"   • Created reusable search best practices framework")
-        print(f"   • Demonstrated systematic search methodology improvement with quantified results")
-        print(f"   • Ready for high-quality research gap discovery with precise search techniques")
+        print(f"\n📂 OUTPUT FILES CREATED IN ANALYSIS/00-01-RETRIEVAL-VALIDATION/:")
+        print(f"   📊 00-01-validation-dashboard.png - Visual overview")
+        print(f"   📋 00-01-condition-quality-scores.csv - Quality metrics per condition")
+        print(f"   📈 00-01-temporal-paper-counts.csv - Papers by year")
+        print(f"   🔍 00-01-data-gaps.csv - Missing data analysis")
+        print(f"   ⚠️  00-01-conditions-for-reretrieval.csv - Low quality conditions")
+        print(f"   📄 00-01-validation-report.txt - Comprehensive text report")
+        print(f"   📊 00-01-validation-summary.json - Machine-readable summary")
         
     except Exception as e:
         print(f"❌ Error: {e}")
